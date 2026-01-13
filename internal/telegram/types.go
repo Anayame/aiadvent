@@ -19,3 +19,8 @@ type User struct {
 	ID       int64  `json:"id"`
 	Username string `json:"username"`
 }
+
+type SendMessageResponse struct {
+	Ok     bool    `json:"ok"`
+	Result Message `json:"result"`
+}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,14 +16,43 @@ import (
 )
 
 type stubBot struct {
-	mu   sync.Mutex
-	msgs []string
+	mu       sync.Mutex
+	msgs     []string
+	nextID   int64
+	messages map[int64]string
 }
 
-func (s *stubBot) SendMessage(ctx context.Context, chatID int64, text string) error {
+func (s *stubBot) SendMessage(ctx context.Context, chatID int64, text string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.msgs = append(s.msgs, text)
+	messageID := s.nextID
+	s.nextID++
+	if s.messages == nil {
+		s.messages = make(map[int64]string)
+	}
+	s.messages[messageID] = text
+	return messageID, nil
+}
+
+func (s *stubBot) EditMessage(ctx context.Context, chatID int64, messageID int64, text string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.messages == nil {
+		s.messages = make(map[int64]string)
+	}
+	s.messages[messageID] = text
+
+	// Update the message in msgs slice if it exists
+	for i, msg := range s.msgs {
+		if s.messages[int64(i)] == msg {
+			s.msgs[i] = text
+			break
+		}
+	}
+
 	return nil
 }
 
@@ -39,6 +69,8 @@ func (s *stubBot) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.msgs = nil
+	s.messages = nil
+	s.nextID = 0
 }
 
 type stubLLM struct {
@@ -147,7 +179,7 @@ func TestPrivateCommandRequiresAuth(t *testing.T) {
 	rrQuestion := httptest.NewRecorder()
 	handler.ServeHTTP(rrQuestion, reqQuestion)
 
-	waitForMessages(t, bot, 3, 500*time.Millisecond)
+	waitForMessages(t, bot, 2, 500*time.Millisecond)
 }
 
 func TestWebhookRespondsFastWithSlowLLM(t *testing.T) {
@@ -196,4 +228,169 @@ func waitForMessages(t *testing.T, bot *stubBot, min int, timeout time.Duration)
 	}
 
 	t.Fatalf("expected at least %d messages, got %d", min, len(bot.Messages()))
+}
+
+func TestSplitMessage(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		maxLen   int
+		expected []string
+	}{
+		{
+			name:     "short message",
+			input:    "Hello world",
+			maxLen:   20,
+			expected: []string{"Hello world"},
+		},
+		{
+			name:   "long message splits on space",
+			input:  "This is a very long message that should be split into multiple parts",
+			maxLen: 20,
+			expected: []string{
+				"This is a very long",
+				"message that should",
+				"be split into",
+				"multiple parts",
+			},
+		},
+		{
+			name:   "long message without spaces",
+			input:  "Thisisaverylongmessagewithoutanyspacesthatshouldbesplit",
+			maxLen: 20,
+			expected: []string{
+				"Thisisaverylongmessa",
+				"gewithoutanyspacesth",
+				"atshouldbesplit",
+			},
+		},
+		{
+			name:     "empty message",
+			input:    "",
+			maxLen:   20,
+			expected: []string{""},
+		},
+		{
+			name:     "message with newlines",
+			input:    "Line 1\nLine 2\nLine 3",
+			maxLen:   10,
+			expected: []string{"Line 1", "Line 2", "Line 3"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := splitMessage(tt.input, tt.maxLen)
+			if len(result) != len(tt.expected) {
+				t.Fatalf("expected %d parts, got %d. Result: %v", len(tt.expected), len(result), result)
+			}
+			for i, expected := range tt.expected {
+				if result[i] != expected {
+					t.Errorf("part %d: expected %q, got %q", i, expected, result[i])
+				}
+			}
+		})
+	}
+}
+
+func TestSendMessageWithChunks(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bot := &stubBot{}
+	authService := auth.NewService("pass", time.Hour, auth.NewMemoryStore())
+
+	handler := NewWebhookHandler(WebhookDeps{
+		Auth:          authService,
+		Bot:           bot,
+		Logger:        logger,
+		AdminPassword: "admin",
+		SessionTTL:    time.Hour,
+	})
+
+	ctx := context.Background()
+	chatID := int64(123)
+
+	// Короткое сообщение - должно отправиться одним куском
+	shortMsg := "Hello world"
+	bot.Reset()
+	handler.sendMessageWithChunks(ctx, chatID, shortMsg)
+	msgs := bot.Messages()
+	if len(msgs) != 1 || msgs[0] != shortMsg {
+		t.Errorf("short message: expected 1 message %q, got %v", shortMsg, msgs)
+	}
+
+	// Длинное сообщение - должно разбиться на части
+	longMsg := ""
+	for len(longMsg) < maxMessageLength*2 {
+		longMsg += "This is a very long message that should be split into multiple parts because it exceeds the maximum message length limit for Telegram Bot API. "
+	}
+
+	bot.Reset()
+	handler.sendMessageWithChunks(ctx, chatID, longMsg)
+	msgs = bot.Messages()
+
+	// Проверяем, что отправлено несколько сообщений
+	if len(msgs) <= 1 {
+		t.Errorf("long message: expected multiple messages, got %d: %v", len(msgs), msgs)
+	}
+
+	// Проверяем, что все части вместе дают оригинальное сообщение (с нормализацией пробелов)
+	var reconstructed string
+	for _, msg := range msgs {
+		reconstructed += msg + " "
+	}
+	reconstructed = strings.TrimSpace(reconstructed)
+
+	// Нормализуем пробелы в оригинальном сообщении для сравнения
+	normalizedOriginal := strings.Join(strings.Fields(longMsg), " ")
+	if reconstructed != normalizedOriginal {
+		t.Errorf("reconstructed message doesn't match original.\nOriginal: %q\nReconstructed: %q", normalizedOriginal, reconstructed)
+	}
+
+	// Проверяем, что каждая часть не превышает максимальную длину
+	for i, msg := range msgs {
+		if len(msg) > maxMessageLength {
+			t.Errorf("message part %d exceeds max length: %d > %d", i, len(msg), maxMessageLength)
+		}
+	}
+}
+
+func TestSendThinkingAnimation(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bot := &stubBot{}
+	authService := auth.NewService("pass", time.Hour, auth.NewMemoryStore())
+
+	handler := NewWebhookHandler(WebhookDeps{
+		Auth:          authService,
+		Bot:           bot,
+		Logger:        logger,
+		AdminPassword: "admin",
+		SessionTTL:    time.Hour,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	chatID := int64(123)
+	bot.Reset()
+
+	_, cancelAnimation, err := handler.sendThinkingAnimation(ctx, chatID)
+	if err != nil {
+		t.Fatalf("sendThinkingAnimation failed: %v", err)
+	}
+	defer cancelAnimation()
+
+	// Ждем немного, чтобы анимация успела поработать
+	time.Sleep(1200 * time.Millisecond)
+
+	cancelAnimation()
+
+	msgs := bot.Messages()
+	if len(msgs) != 1 {
+		t.Errorf("expected 1 message, got %d: %v", len(msgs), msgs)
+	}
+
+	// Проверяем, что сообщение было создано
+	if msgs[0] == "" {
+		t.Errorf("expected message to be created")
+	}
 }

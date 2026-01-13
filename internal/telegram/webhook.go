@@ -20,6 +20,10 @@ const (
 	defaultProcessingTimeout = 60 * time.Second
 	defaultAcquireTimeout    = 200 * time.Millisecond
 	defaultMaxWorkers        = 10
+	// Максимальная длина сообщения Telegram Bot API
+	maxMessageLength = 4096
+	// Минимальная задержка между частями сообщения
+	messagePartDelay = 100 * time.Millisecond
 )
 
 type pendingCommand string
@@ -161,6 +165,7 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 			return
 		}
 		h.setAskMode(msg.From.ID, true)
+		h.setAskJSONMode(msg.From.ID, false, "")
 		h.reply(ctx, msg.Chat.ID, "Режим вопросов включен. Отправляйте сообщения — я буду отвечать. Команда /end выключит режим.")
 		if arg != "" {
 			h.handleAsk(ctx, msg, arg)
@@ -178,6 +183,7 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 			h.reply(ctx, msg.Chat.ID, fmt.Sprintf("Неизвестный контракт \"%s\". Доступные: %s", contractName, strings.Join(llmcontracts.AvailableContracts(), ", ")))
 			return
 		}
+		h.setAskMode(msg.From.ID, false)
 		h.setAskJSONMode(msg.From.ID, true, contractName)
 		h.reply(ctx, msg.Chat.ID, fmt.Sprintf("Режим JSON-вопросов включен (контракт: %s). Отправляйте сообщения. /end выключит режим.", contractName))
 	case "/end":
@@ -237,15 +243,24 @@ func (h *WebhookHandler) handleAsk(ctx context.Context, msg *Message, question s
 		return
 	}
 
-	h.reply(ctx, msg.Chat.ID, "Думаю...")
+	thinkingMessageID, cancelAnimation, err := h.sendThinkingAnimation(ctx, msg.Chat.ID)
+	if err != nil {
+		h.logger.Error("send thinking animation failed", slog.String("error", err.Error()))
+		h.reply(ctx, msg.Chat.ID, "Ошибка отправки сообщения.")
+		return
+	}
+	defer cancelAnimation()
 
 	answer, err := h.llm.ChatCompletion(ctx, question, "")
 	if err != nil {
+		cancelAnimation()
 		h.logger.Error("llm error", slog.String("error", err.Error()))
-		h.reply(ctx, msg.Chat.ID, "Ошибка LLM. Попробуйте позже.")
+		h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, "Ошибка LLM. Попробуйте позже.")
 		return
 	}
-	h.reply(ctx, msg.Chat.ID, answer)
+
+	cancelAnimation()
+	h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, answer)
 }
 
 func (h *WebhookHandler) handleAskJSON(ctx context.Context, msg *Message, question string, contractName string) {
@@ -254,22 +269,32 @@ func (h *WebhookHandler) handleAskJSON(ctx context.Context, msg *Message, questi
 		return
 	}
 
-	h.reply(ctx, msg.Chat.ID, "Думаю...")
+	thinkingMessageID, cancelAnimation, err := h.sendThinkingAnimation(ctx, msg.Chat.ID)
+	if err != nil {
+		h.logger.Error("send thinking animation failed", slog.String("error", err.Error()))
+		h.reply(ctx, msg.Chat.ID, "Ошибка отправки сообщения.")
+		return
+	}
+	defer cancelAnimation()
 
 	systemPrompt, err := llmcontracts.SystemPrompt(contractName)
 	if err != nil {
+		cancelAnimation()
 		h.logger.Error("system prompt error", slog.String("error", err.Error()))
-		h.reply(ctx, msg.Chat.ID, "Не удалось получить контракт LLM.")
+		h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, "Не удалось получить контракт LLM.")
 		return
 	}
 
 	answer, err := h.llm.ChatCompletionWithSystem(ctx, systemPrompt, question, "")
 	if err != nil {
+		cancelAnimation()
 		h.logger.Error("llm error", slog.String("error", err.Error()))
-		h.reply(ctx, msg.Chat.ID, "Ошибка LLM. Попробуйте позже.")
+		h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, "Ошибка LLM. Попробуйте позже.")
 		return
 	}
-	h.reply(ctx, msg.Chat.ID, answer)
+
+	cancelAnimation()
+	h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, answer)
 
 	validation, err := llmcontracts.Validate(contractName, answer)
 	if err != nil {
@@ -302,10 +327,91 @@ func (h *WebhookHandler) handleAskJSON(ctx context.Context, msg *Message, questi
 	h.reply(ctx, msg.Chat.ID, strings.TrimRight(b.String(), "\n"))
 }
 
-func (h *WebhookHandler) reply(ctx context.Context, chatID int64, text string) {
-	if err := h.bot.SendMessage(ctx, chatID, text); err != nil {
-		h.logger.Error("send message failed", slog.String("error", err.Error()))
+// splitMessage разбивает длинное сообщение на части, не превышающие maxMessageLength
+func splitMessage(text string, maxLength int) []string {
+	if len(text) <= maxLength {
+		return []string{text}
 	}
+
+	var parts []string
+	remaining := text
+
+	for len(remaining) > maxLength {
+		// Ищем последний пробел перед лимитом в широком диапазоне
+		cutIndex := maxLength
+		for i := maxLength - 1; i >= 0; i-- {
+			if remaining[i] == ' ' || remaining[i] == '\n' {
+				cutIndex = i
+				break
+			}
+		}
+
+		// Если пробел найден, используем его
+		part := remaining[:cutIndex]
+		parts = append(parts, strings.TrimSpace(part))
+
+		// Оставшаяся часть без начальных пробелов
+		remaining = strings.TrimLeft(remaining[cutIndex:], " \n")
+	}
+
+	if remaining != "" {
+		parts = append(parts, remaining)
+	}
+
+	return parts
+}
+
+// sendMessageWithChunks отправляет сообщение, разбивая его на части если необходимо
+func (h *WebhookHandler) sendMessageWithChunks(ctx context.Context, chatID int64, text string) {
+	parts := splitMessage(text, maxMessageLength)
+
+	for i, part := range parts {
+		if i > 0 {
+			// Добавляем небольшую задержку между частями
+			time.Sleep(messagePartDelay)
+		}
+
+		if _, err := h.bot.SendMessage(ctx, chatID, part); err != nil {
+			h.logger.Error("send message failed", slog.String("error", err.Error()))
+			return
+		}
+	}
+}
+
+func (h *WebhookHandler) reply(ctx context.Context, chatID int64, text string) {
+	h.sendMessageWithChunks(ctx, chatID, text)
+}
+
+// sendThinkingAnimation отправляет анимированное сообщение "Думаю" с бегающими точками
+func (h *WebhookHandler) sendThinkingAnimation(ctx context.Context, chatID int64) (int64, context.CancelFunc, error) {
+	messageID, err := h.bot.SendMessage(ctx, chatID, "Думаю")
+	if err != nil {
+		return 0, nil, err
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	go func() {
+		states := []string{"Думаю", "Думаю.", "Думаю..", "Думаю..."}
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		i := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				i = (i + 1) % len(states)
+				if err := h.bot.EditMessage(ctx, chatID, messageID, states[i]); err != nil {
+					h.logger.Error("edit thinking message failed", slog.String("error", err.Error()))
+					return
+				}
+			}
+		}
+	}()
+
+	return messageID, cancel, nil
 }
 
 func (h *WebhookHandler) processAsync(msg *Message, text string) {
