@@ -1,14 +1,29 @@
-ARG GO_VERSION=1
-FROM golang:${GO_VERSION}-bookworm as builder
+# syntax=docker/dockerfile:1
+ARG GO_VERSION=1.22
+FROM golang:${GO_VERSION}-bookworm AS builder
 
 WORKDIR /usr/src/app
+
+# Сначала только модули (для кеша)
 COPY go.mod go.sum ./
-RUN go mod download && go mod verify
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download && go mod verify
+
+# Потом весь код
 COPY . .
-RUN go build -v -o /run-app .
+
+# Сборка именно cmd/app
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -v -o /run-app ./cmd/app
 
 
 FROM debian:bookworm
 
-COPY --from=builder /run-app /usr/local/bin/
+# (опционально) сертификаты, если делаешь HTTPS запросы (OpenRouter/Telegram)
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /run-app /usr/local/bin/run-app
+
 CMD ["run-app"]

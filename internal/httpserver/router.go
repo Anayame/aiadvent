@@ -5,8 +5,9 @@ import (
 
 	"aiadvent/internal/middleware"
 
-	"github.com/go-chi/chi/v5"
 	"log/slog"
+
+	"github.com/go-chi/chi/v5"
 )
 
 type RouterDeps struct {
