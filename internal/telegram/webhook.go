@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"aiadvent/internal/auth"
@@ -19,6 +20,17 @@ const (
 	defaultAcquireTimeout    = 200 * time.Millisecond
 	defaultMaxWorkers        = 10
 )
+
+type pendingCommand string
+
+const (
+	pendingCommandLogin pendingCommand = "login"
+)
+
+type userState struct {
+	pending pendingCommand
+	askMode bool
+}
 
 type AuthService interface {
 	Login(ctx context.Context, userID int64, password string) (auth.Session, error)
@@ -50,6 +62,8 @@ type WebhookHandler struct {
 	sem           chan struct{}
 	processingTTL time.Duration
 	acquireTTL    time.Duration
+	stateMu       sync.Mutex
+	state         map[int64]userState
 }
 
 func NewWebhookHandler(deps WebhookDeps) *WebhookHandler {
@@ -76,6 +90,7 @@ func NewWebhookHandler(deps WebhookDeps) *WebhookHandler {
 		sem:           make(chan struct{}, maxWorkers),
 		processingTTL: processingTTL,
 		acquireTTL:    acquireTTL,
+		state:         make(map[int64]userState),
 	}
 }
 
@@ -117,11 +132,18 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 
 	switch cmd {
 	case "/start":
-		h.reply(ctx, msg.Chat.ID, "Привет! Доступные команды: /login <пароль>, /ask <текст>, /logout, /me")
+		h.reply(ctx, msg.Chat.ID, "Привет! Команды: /login, /ask (включает режим вопросов, выход /end), /logout, /me. Введите команду, параметр — отдельным сообщением.")
 	case "/login":
+		if arg == "" {
+			h.setPending(msg.From.ID, pendingCommandLogin)
+			h.reply(ctx, msg.Chat.ID, "Введите пароль следующим сообщением")
+			return
+		}
 		h.handleLogin(ctx, msg, arg)
 	case "/logout":
 		h.auth.Logout(ctx, msg.From.ID)
+		h.setAskMode(msg.From.ID, false)
+		h.clearPending(msg.From.ID)
 		h.reply(ctx, msg.Chat.ID, "Вы вышли")
 	case "/me":
 		authStatus := "не авторизован"
@@ -130,7 +152,22 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 		}
 		h.reply(ctx, msg.Chat.ID, fmt.Sprintf("Ваш id: %d, статус: %s", msg.From.ID, authStatus))
 	case "/ask":
-		h.handleAsk(ctx, msg, arg)
+		if !h.auth.IsAuthorized(ctx, msg.From.ID) {
+			h.reply(ctx, msg.Chat.ID, "Требуется авторизация. Отправьте /login, затем пароль отдельным сообщением.")
+			return
+		}
+		h.setAskMode(msg.From.ID, true)
+		h.reply(ctx, msg.Chat.ID, "Режим вопросов включен. Отправляйте сообщения — я буду отвечать. Команда /end выключит режим.")
+		if arg != "" {
+			h.handleAsk(ctx, msg, arg)
+		}
+	case "/end":
+		if h.isAskMode(msg.From.ID) {
+			h.setAskMode(msg.From.ID, false)
+			h.reply(ctx, msg.Chat.ID, "Режим вопросов выключен.")
+		} else {
+			h.reply(ctx, msg.Chat.ID, "Вы не в режиме вопросов. Отправьте /ask, чтобы начать.")
+		}
 	default:
 		h.reply(ctx, msg.Chat.ID, "Неизвестная команда. Попробуйте /start")
 	}
@@ -138,15 +175,22 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 
 func (h *WebhookHandler) handleText(ctx context.Context, msg *Message, text string) {
 	if !h.auth.IsAuthorized(ctx, msg.From.ID) {
-		h.reply(ctx, msg.Chat.ID, "Нужно войти: /login <пароль>")
+		h.reply(ctx, msg.Chat.ID, "Нужно войти: отправьте /login и затем пароль отдельным сообщением")
 		return
 	}
-	h.handleAsk(ctx, msg, text)
+
+	if h.isAskMode(msg.From.ID) {
+		h.handleAsk(ctx, msg, text)
+		return
+	}
+
+	h.reply(ctx, msg.Chat.ID, "Чтобы задать вопрос, включите режим /ask. Команда /end выключает режим.")
 }
 
 func (h *WebhookHandler) handleLogin(ctx context.Context, msg *Message, password string) {
 	if password == "" {
-		h.reply(ctx, msg.Chat.ID, "Введите пароль: /login <пароль>")
+		h.setPending(msg.From.ID, pendingCommandLogin)
+		h.reply(ctx, msg.Chat.ID, "Введите пароль следующим сообщением")
 		return
 	}
 	_, err := h.auth.Login(ctx, msg.From.ID, password)
@@ -159,11 +203,11 @@ func (h *WebhookHandler) handleLogin(ctx context.Context, msg *Message, password
 
 func (h *WebhookHandler) handleAsk(ctx context.Context, msg *Message, question string) {
 	if question == "" {
-		h.reply(ctx, msg.Chat.ID, "Нужно задать вопрос после /ask")
+		h.reply(ctx, msg.Chat.ID, "Нужно задать вопрос. Отправьте текст следующим сообщением")
 		return
 	}
 	if !h.auth.IsAuthorized(ctx, msg.From.ID) {
-		h.reply(ctx, msg.Chat.ID, "Требуется авторизация. Используйте /login <пароль>")
+		h.reply(ctx, msg.Chat.ID, "Требуется авторизация. Отправьте /login, затем пароль отдельным сообщением.")
 		return
 	}
 
@@ -211,11 +255,26 @@ func (h *WebhookHandler) dispatch(ctx context.Context, msg *Message, text string
 	}
 
 	if strings.HasPrefix(text, "/") {
+		h.clearPending(msg.From.ID)
 		h.handleCommand(ctx, msg, text)
 		return
 	}
 
+	if cmd, ok := h.popPending(msg.From.ID); ok {
+		h.handlePending(ctx, msg, cmd, text)
+		return
+	}
+
 	h.handleText(ctx, msg, text)
+}
+
+func (h *WebhookHandler) handlePending(ctx context.Context, msg *Message, cmd pendingCommand, text string) {
+	switch cmd {
+	case pendingCommandLogin:
+		h.handleLogin(ctx, msg, text)
+	default:
+		h.reply(ctx, msg.Chat.ID, "Неизвестное состояние. Попробуйте снова отправить команду.")
+	}
 }
 
 func (h *WebhookHandler) acquireSlot() bool {
@@ -241,4 +300,53 @@ func (h *WebhookHandler) releaseSlot() {
 	case <-h.sem:
 	default:
 	}
+}
+
+func (h *WebhookHandler) setPending(userID int64, cmd pendingCommand) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.pending = cmd
+	h.state[userID] = state
+}
+
+func (h *WebhookHandler) popPending(userID int64) (pendingCommand, bool) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok || state.pending == "" {
+		return "", false
+	}
+	cmd := state.pending
+	state.pending = ""
+	h.state[userID] = state
+	return cmd, true
+}
+
+func (h *WebhookHandler) clearPending(userID int64) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.pending = ""
+	h.state[userID] = state
+}
+
+func (h *WebhookHandler) setAskMode(userID int64, enabled bool) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.askMode = enabled
+	h.state[userID] = state
+}
+
+func (h *WebhookHandler) isAskMode(userID int64) bool {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	return ok && state.askMode
 }

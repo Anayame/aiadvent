@@ -102,7 +102,7 @@ func TestPrivateCommandRequiresAuth(t *testing.T) {
 	})
 
 	// ask без авторизации
-	updateAsk := Update{Message: &Message{Text: "/ask hi", Chat: Chat{ID: 1}, From: &User{ID: 7}}}
+	updateAsk := Update{Message: &Message{Text: "/ask", Chat: Chat{ID: 1}, From: &User{ID: 7}}}
 	bodyAsk, _ := json.Marshal(updateAsk)
 	reqAsk := httptest.NewRequest("POST", "/telegram/webhook", bytes.NewReader(bodyAsk))
 	rrAsk := httptest.NewRecorder()
@@ -111,20 +111,35 @@ func TestPrivateCommandRequiresAuth(t *testing.T) {
 
 	// login
 	bot.Reset()
-	updateLogin := Update{Message: &Message{Text: "/login pass", Chat: Chat{ID: 1}, From: &User{ID: 7}}}
+	updateLogin := Update{Message: &Message{Text: "/login", Chat: Chat{ID: 1}, From: &User{ID: 7}}}
 	bodyLogin, _ := json.Marshal(updateLogin)
 	reqLogin := httptest.NewRequest("POST", "/telegram/webhook", bytes.NewReader(bodyLogin))
 	rrLogin := httptest.NewRecorder()
 	handler.ServeHTTP(rrLogin, reqLogin)
+	waitForMessages(t, bot, 1, 500*time.Millisecond)
+
+	updatePassword := Update{Message: &Message{Text: "pass", Chat: Chat{ID: 1}, From: &User{ID: 7}}}
+	bodyPassword, _ := json.Marshal(updatePassword)
+	reqPassword := httptest.NewRequest("POST", "/telegram/webhook", bytes.NewReader(bodyPassword))
+	rrPassword := httptest.NewRecorder()
+	handler.ServeHTTP(rrPassword, reqPassword)
+	waitForMessages(t, bot, 2, 500*time.Millisecond)
 
 	// ask снова
-	updateAsk2 := Update{Message: &Message{Text: "/ask hi", Chat: Chat{ID: 1}, From: &User{ID: 7}}}
+	bot.Reset()
+	updateAsk2 := Update{Message: &Message{Text: "/ask", Chat: Chat{ID: 1}, From: &User{ID: 7}}}
 	bodyAsk2, _ := json.Marshal(updateAsk2)
 	reqAsk2 := httptest.NewRequest("POST", "/telegram/webhook", bytes.NewReader(bodyAsk2))
 	rrAsk2 := httptest.NewRecorder()
 	handler.ServeHTTP(rrAsk2, reqAsk2)
 
-	waitForMessages(t, bot, 1, 500*time.Millisecond)
+	updateQuestion := Update{Message: &Message{Text: "hi", Chat: Chat{ID: 1}, From: &User{ID: 7}}}
+	bodyQuestion, _ := json.Marshal(updateQuestion)
+	reqQuestion := httptest.NewRequest("POST", "/telegram/webhook", bytes.NewReader(bodyQuestion))
+	rrQuestion := httptest.NewRecorder()
+	handler.ServeHTTP(rrQuestion, reqQuestion)
+
+	waitForMessages(t, bot, 3, 500*time.Millisecond)
 }
 
 func TestWebhookRespondsFastWithSlowLLM(t *testing.T) {
