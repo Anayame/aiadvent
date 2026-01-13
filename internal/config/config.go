@@ -32,7 +32,13 @@ type TelegramConfig struct {
 func Load() (Config, error) {
 	var cfg Config
 
-	cfg.HTTPAddr = getEnv("HTTP_ADDR", ":8080")
+	port := os.Getenv("PORT")
+	if port != "" {
+		cfg.HTTPAddr = ":" + port
+	} else {
+		cfg.HTTPAddr = getEnv("HTTP_ADDR", ":8080")
+	}
+
 	cfg.LogLevel = getEnv("LOG_LEVEL", "info")
 	cfg.AdminPassword = getEnv("ADMIN_PASSWORD", "")
 
