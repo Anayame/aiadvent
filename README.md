@@ -23,7 +23,9 @@ make run               # go run ./cmd/app
 - `HTTP_ADDR` — адрес HTTP-сервера, по умолчанию `:8080`
 - `LOG_LEVEL` — `debug|info|warn|error`, по умолчанию `info`
 - `ADMIN_PASSWORD` — пароль для `/login`
-- `SESSION_TTL` — длительность жизни сессии, например `2h`
+- `SESSION_TTL` — длительность жизни сессии, например `2h`; значение `0` делает сессии бессрочными
+- `AUTH_STORE_TYPE` — `file|memory`, по умолчанию `file`
+- `AUTH_STORE_PATH` — путь к файлу сессий для `file` store, по умолчанию `/data/auth_sessions.json`
 - `OPENROUTER_API_KEY` — ключ OpenRouter
 - `OPENROUTER_BASE_URL` — базовый URL, по умолчанию `https://openrouter.ai/api/v1`
 - `OPENROUTER_DEFAULT_MODEL` — модель по умолчанию, обязательна для LLM
@@ -53,7 +55,7 @@ make run               # go run ./cmd/app
 ## Примеры запросов
 Health-check:
 ```bash
-curl -i http://localhost:8080/healthz
+curl -i http://localhost:8080/ping
 ```
 
 Имитация Telegram webhook (секрет можно опустить, если не задан):

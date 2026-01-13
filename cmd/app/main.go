@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,7 +30,17 @@ func main() {
 	httpClient := transport.NewHTTPClient(cfg.RequestTimeout)
 	llmClient := llm.NewOpenRouterClient(cfg.OpenRouter, httpClient, logger)
 
-	store := auth.NewMemoryStore()
+	var store auth.Store
+	switch strings.ToLower(cfg.AuthStoreType) {
+	case "memory":
+		store = auth.NewMemoryStore()
+	default:
+		fileStore, err := auth.NewFileStore(cfg.AuthStorePath)
+		if err != nil {
+			log.Fatalf("failed to init file store: %v", err)
+		}
+		store = fileStore
+	}
 	authService := auth.NewService(cfg.AdminPassword, cfg.SessionTTL, store)
 
 	telegramClient := telegram.NewClient(cfg.Telegram, httpClient)

@@ -41,10 +41,15 @@ func (s *Service) Login(ctx context.Context, userID int64, password string) (Ses
 		return Session{}, ErrUnauthorized
 	}
 
+	expiresAt := time.Time{}
+	if s.ttl > 0 {
+		expiresAt = time.Now().Add(s.ttl)
+	}
+
 	session := Session{
 		UserID:    userID,
 		Token:     fmt.Sprintf("tok_%d_%d", userID, time.Now().UnixNano()),
-		ExpiresAt: time.Now().Add(s.ttl),
+		ExpiresAt: expiresAt,
 	}
 	if err := s.store.Save(session); err != nil {
 		return Session{}, fmt.Errorf("save session: %w", err)
@@ -61,7 +66,12 @@ func (s *Service) IsAuthorized(ctx context.Context, userID int64) bool {
 	if !ok {
 		return false
 	}
-	if time.Now().After(session.ExpiresAt) {
+
+	// TTL == 0 означает, что сессии вечные и не истекают по времени.
+	if s.ttl <= 0 {
+		return true
+	}
+	if session.ExpiresAt.IsZero() || time.Now().After(session.ExpiresAt) {
 		s.store.Delete(userID)
 		return false
 	}

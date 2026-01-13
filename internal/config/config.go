@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -12,6 +13,8 @@ type Config struct {
 	LogLevel       string
 	AdminPassword  string
 	SessionTTL     time.Duration
+	AuthStorePath  string
+	AuthStoreType  string
 	RequestTimeout time.Duration
 	OpenRouter     OpenRouterConfig
 	Telegram       TelegramConfig
@@ -47,6 +50,9 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parse SESSION_TTL: %w", err)
 	}
 	cfg.SessionTTL = sessionTTL
+
+	cfg.AuthStorePath = getEnv("AUTH_STORE_PATH", "/data/auth_sessions.json")
+	cfg.AuthStoreType = strings.ToLower(getEnv("AUTH_STORE_TYPE", "file"))
 
 	reqTimeout, err := parseDuration(getEnv("HTTP_CLIENT_TIMEOUT", "15s"))
 	if err != nil {
