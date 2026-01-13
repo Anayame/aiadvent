@@ -32,7 +32,7 @@ make run               # go run ./cmd/app
 - `TELEGRAM_WEBHOOK_SECRET` — секрет заголовка `X-Telegram-Bot-Api-Secret-Token` (если пустой — проверка отключена)
 
 ## HTTP эндпоинты
-- `GET /healthz` — health-check, 200 OK
+- `GET /ping` — health-check, 200 OK
 - `POST /telegram/webhook` — прием Telegram update, опционально проверяется `X-Telegram-Bot-Api-Secret-Token`
 
 Формат ошибок (JSON):
