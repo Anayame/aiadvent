@@ -14,6 +14,12 @@ import (
 	"log/slog"
 )
 
+const (
+	defaultProcessingTimeout = 60 * time.Second
+	defaultAcquireTimeout    = 200 * time.Millisecond
+	defaultMaxWorkers        = 10
+)
+
 type AuthService interface {
 	Login(ctx context.Context, userID int64, password string) (auth.Session, error)
 	Logout(ctx context.Context, userID int64)
@@ -28,6 +34,10 @@ type WebhookDeps struct {
 	AdminPassword string
 	SessionTTL    time.Duration
 	WebhookSecret string
+	// Необязательные настройки параллельной обработки.
+	ProcessingTimeout time.Duration
+	AcquireTimeout    time.Duration
+	MaxWorkers        int
 }
 
 type WebhookHandler struct {
@@ -37,9 +47,25 @@ type WebhookHandler struct {
 	logger        *slog.Logger
 	adminPassword string
 	webhookSecret string
+	sem           chan struct{}
+	processingTTL time.Duration
+	acquireTTL    time.Duration
 }
 
 func NewWebhookHandler(deps WebhookDeps) *WebhookHandler {
+	maxWorkers := deps.MaxWorkers
+	if maxWorkers <= 0 {
+		maxWorkers = defaultMaxWorkers
+	}
+	processingTTL := deps.ProcessingTimeout
+	if processingTTL <= 0 {
+		processingTTL = defaultProcessingTimeout
+	}
+	acquireTTL := deps.AcquireTimeout
+	if acquireTTL <= 0 {
+		acquireTTL = defaultAcquireTimeout
+	}
+
 	return &WebhookHandler{
 		auth:          deps.Auth,
 		llm:           deps.LLM,
@@ -47,6 +73,9 @@ func NewWebhookHandler(deps WebhookDeps) *WebhookHandler {
 		logger:        deps.Logger,
 		adminPassword: deps.AdminPassword,
 		webhookSecret: deps.WebhookSecret,
+		sem:           make(chan struct{}, maxWorkers),
+		processingTTL: processingTTL,
+		acquireTTL:    acquireTTL,
 	}
 }
 
@@ -68,23 +97,14 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
 	text := strings.TrimSpace(upd.Message.Text)
 
-	if text == "" {
-		h.reply(ctx, upd.Message.Chat.ID, "Пустое сообщение. Используйте /start.")
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	if strings.HasPrefix(text, "/") {
-		h.handleCommand(ctx, upd.Message, text)
-	} else {
-		h.handleText(ctx, upd.Message, text)
-	}
-
+	// Быстро отвечаем Telegram, основную обработку переносим в фон.
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"ok":true}`))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"ok":true}`))
+
+	h.processAsync(upd.Message, text)
 }
 
 func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text string) {
@@ -147,6 +167,8 @@ func (h *WebhookHandler) handleAsk(ctx context.Context, msg *Message, question s
 		return
 	}
 
+	h.reply(ctx, msg.Chat.ID, "Думаю...")
+
 	answer, err := h.llm.ChatCompletion(ctx, question, "")
 	if err != nil {
 		h.logger.Error("llm error", slog.String("error", err.Error()))
@@ -159,5 +181,64 @@ func (h *WebhookHandler) handleAsk(ctx context.Context, msg *Message, question s
 func (h *WebhookHandler) reply(ctx context.Context, chatID int64, text string) {
 	if err := h.bot.SendMessage(ctx, chatID, text); err != nil {
 		h.logger.Error("send message failed", slog.String("error", err.Error()))
+	}
+}
+
+func (h *WebhookHandler) processAsync(msg *Message, text string) {
+	if !h.acquireSlot() {
+		return
+	}
+
+	go func(msg *Message, text string) {
+		defer h.releaseSlot()
+		defer func() {
+			if r := recover(); r != nil {
+				h.logger.Error("webhook goroutine panic recovered", slog.Any("panic", r))
+			}
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), h.processingTTL)
+		defer cancel()
+
+		h.dispatch(ctx, msg, text)
+	}(msg, text)
+}
+
+func (h *WebhookHandler) dispatch(ctx context.Context, msg *Message, text string) {
+	if text == "" {
+		h.reply(ctx, msg.Chat.ID, "Пустое сообщение. Используйте /start.")
+		return
+	}
+
+	if strings.HasPrefix(text, "/") {
+		h.handleCommand(ctx, msg, text)
+		return
+	}
+
+	h.handleText(ctx, msg, text)
+}
+
+func (h *WebhookHandler) acquireSlot() bool {
+	if h.sem == nil {
+		return true
+	}
+
+	select {
+	case h.sem <- struct{}{}:
+		return true
+	case <-time.After(h.acquireTTL):
+		h.logger.Warn("webhook update dropped: workers are busy")
+		return false
+	}
+}
+
+func (h *WebhookHandler) releaseSlot() {
+	if h.sem == nil {
+		return
+	}
+
+	select {
+	case <-h.sem:
+	default:
 	}
 }

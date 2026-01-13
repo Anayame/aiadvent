@@ -1,0 +1,30 @@
+# VCS
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Go build artifacts
+bin/
+dist/
+out/
+tmp/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Logs
+*.log
+
+# Local env
+.env
+.env.*

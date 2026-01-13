@@ -11,15 +11,34 @@ import (
 	"aiadvent/internal/auth"
 	"log/slog"
 	"os"
+	"sync"
 )
 
 type stubBot struct {
+	mu   sync.Mutex
 	msgs []string
 }
 
 func (s *stubBot) SendMessage(ctx context.Context, chatID int64, text string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.msgs = append(s.msgs, text)
 	return nil
+}
+
+func (s *stubBot) Messages() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result := make([]string, len(s.msgs))
+	copy(result, s.msgs)
+	return result
+}
+
+func (s *stubBot) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.msgs = nil
 }
 
 type stubLLM struct {
@@ -27,6 +46,20 @@ type stubLLM struct {
 }
 
 func (s *stubLLM) ChatCompletion(ctx context.Context, prompt string, model string) (string, error) {
+	return s.answer, nil
+}
+
+type slowLLM struct {
+	delay  time.Duration
+	answer string
+}
+
+func (s *slowLLM) ChatCompletion(ctx context.Context, prompt string, model string) (string, error) {
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 	return s.answer, nil
 }
 
@@ -53,9 +86,7 @@ func TestPublicCommandDoesNotRequireAuth(t *testing.T) {
 	if rr.Code != 200 {
 		t.Fatalf("expected status 200, got %d", rr.Code)
 	}
-	if len(bot.msgs) == 0 {
-		t.Fatalf("expected bot message")
-	}
+	waitForMessages(t, bot, 1, 500*time.Millisecond)
 }
 
 func TestPrivateCommandRequiresAuth(t *testing.T) {
@@ -76,12 +107,10 @@ func TestPrivateCommandRequiresAuth(t *testing.T) {
 	reqAsk := httptest.NewRequest("POST", "/telegram/webhook", bytes.NewReader(bodyAsk))
 	rrAsk := httptest.NewRecorder()
 	handler.ServeHTTP(rrAsk, reqAsk)
-	if len(bot.msgs) == 0 {
-		t.Fatalf("expected auth prompt message")
-	}
+	waitForMessages(t, bot, 1, 500*time.Millisecond)
 
 	// login
-	bot.msgs = nil
+	bot.Reset()
 	updateLogin := Update{Message: &Message{Text: "/login pass", Chat: Chat{ID: 1}, From: &User{ID: 7}}}
 	bodyLogin, _ := json.Marshal(updateLogin)
 	reqLogin := httptest.NewRequest("POST", "/telegram/webhook", bytes.NewReader(bodyLogin))
@@ -95,7 +124,53 @@ func TestPrivateCommandRequiresAuth(t *testing.T) {
 	rrAsk2 := httptest.NewRecorder()
 	handler.ServeHTTP(rrAsk2, reqAsk2)
 
-	if len(bot.msgs) == 0 {
-		t.Fatalf("expected response after login")
+	waitForMessages(t, bot, 1, 500*time.Millisecond)
+}
+
+func TestWebhookRespondsFastWithSlowLLM(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	bot := &stubBot{}
+	authService := auth.NewService("pass", time.Hour, auth.NewMemoryStore())
+	if _, err := authService.Login(context.Background(), 42, "pass"); err != nil {
+		t.Fatalf("failed to login test user: %v", err)
 	}
+
+	handler := NewWebhookHandler(WebhookDeps{
+		Auth:          authService,
+		LLM:           &slowLLM{delay: 2 * time.Second, answer: "ok"},
+		Bot:           bot,
+		Logger:        logger,
+		AdminPassword: "pass",
+	})
+
+	update := Update{Message: &Message{Text: "/ask hi", Chat: Chat{ID: 1}, From: &User{ID: 42}}}
+	body, _ := json.Marshal(update)
+
+	req := httptest.NewRequest("POST", "/telegram/webhook", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	start := time.Now()
+	handler.ServeHTTP(rr, req)
+	duration := time.Since(start)
+
+	if rr.Code != 200 {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+	if duration > 500*time.Millisecond {
+		t.Fatalf("expected fast response, got %v", duration)
+	}
+}
+
+func waitForMessages(t *testing.T, bot *stubBot, min int, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(bot.Messages()) >= min {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("expected at least %d messages, got %d", min, len(bot.Messages()))
 }
