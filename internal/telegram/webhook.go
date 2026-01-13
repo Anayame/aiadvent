@@ -12,6 +12,7 @@ import (
 	"aiadvent/internal/auth"
 	"aiadvent/internal/httpserver"
 	"aiadvent/internal/llm"
+	"aiadvent/internal/llmcontracts"
 	"log/slog"
 )
 
@@ -28,8 +29,10 @@ const (
 )
 
 type userState struct {
-	pending pendingCommand
-	askMode bool
+	pending         pendingCommand
+	askMode         bool
+	askJSONMode     bool
+	askJSONContract string
 }
 
 type AuthService interface {
@@ -132,7 +135,7 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 
 	switch cmd {
 	case "/start":
-		h.reply(ctx, msg.Chat.ID, "Привет! Команды: /login, /ask (включает режим вопросов, выход /end), /logout, /me. Введите команду, параметр — отдельным сообщением.")
+		h.reply(ctx, msg.Chat.ID, "Привет! Команды: /login, /ask (режим обычных вопросов), /ask_json [contract] (режим контрактных JSON-ответов), выход /end, /logout, /me. Введите команду, параметр — отдельным сообщением.")
 	case "/login":
 		if arg == "" {
 			h.setPending(msg.From.ID, pendingCommandLogin)
@@ -143,6 +146,7 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 	case "/logout":
 		h.auth.Logout(ctx, msg.From.ID)
 		h.setAskMode(msg.From.ID, false)
+		h.setAskJSONMode(msg.From.ID, false, "")
 		h.clearPending(msg.From.ID)
 		h.reply(ctx, msg.Chat.ID, "Вы вышли")
 	case "/me":
@@ -161,12 +165,30 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 		if arg != "" {
 			h.handleAsk(ctx, msg, arg)
 		}
+	case "/ask_json":
+		if !h.auth.IsAuthorized(ctx, msg.From.ID) {
+			h.reply(ctx, msg.Chat.ID, "Требуется авторизация. Отправьте /login, затем пароль отдельным сообщением.")
+			return
+		}
+		contractName := llmcontracts.DefaultContract()
+		if arg != "" {
+			contractName = arg
+		}
+		if !llmcontracts.HasContract(contractName) {
+			h.reply(ctx, msg.Chat.ID, fmt.Sprintf("Неизвестный контракт \"%s\". Доступные: %s", contractName, strings.Join(llmcontracts.AvailableContracts(), ", ")))
+			return
+		}
+		h.setAskJSONMode(msg.From.ID, true, contractName)
+		h.reply(ctx, msg.Chat.ID, fmt.Sprintf("Режим JSON-вопросов включен (контракт: %s). Отправляйте сообщения. /end выключит режим.", contractName))
 	case "/end":
-		if h.isAskMode(msg.From.ID) {
+		ask := h.isAskMode(msg.From.ID)
+		askJSON, _ := h.askJSONState(msg.From.ID)
+		if ask || askJSON {
 			h.setAskMode(msg.From.ID, false)
+			h.setAskJSONMode(msg.From.ID, false, "")
 			h.reply(ctx, msg.Chat.ID, "Режим вопросов выключен.")
 		} else {
-			h.reply(ctx, msg.Chat.ID, "Вы не в режиме вопросов. Отправьте /ask, чтобы начать.")
+			h.reply(ctx, msg.Chat.ID, "Вы не в режиме вопросов. Отправьте /ask или /ask_json, чтобы начать.")
 		}
 	default:
 		h.reply(ctx, msg.Chat.ID, "Неизвестная команда. Попробуйте /start")
@@ -179,12 +201,16 @@ func (h *WebhookHandler) handleText(ctx context.Context, msg *Message, text stri
 		return
 	}
 
+	if askJSON, contract := h.askJSONState(msg.From.ID); askJSON {
+		h.handleAskJSON(ctx, msg, text, contract)
+		return
+	}
 	if h.isAskMode(msg.From.ID) {
 		h.handleAsk(ctx, msg, text)
 		return
 	}
 
-	h.reply(ctx, msg.Chat.ID, "Чтобы задать вопрос, включите режим /ask. Команда /end выключает режим.")
+	h.reply(ctx, msg.Chat.ID, "Чтобы задать вопрос, включите режим /ask или /ask_json. Команда /end выключает режим.")
 }
 
 func (h *WebhookHandler) handleLogin(ctx context.Context, msg *Message, password string) {
@@ -220,6 +246,60 @@ func (h *WebhookHandler) handleAsk(ctx context.Context, msg *Message, question s
 		return
 	}
 	h.reply(ctx, msg.Chat.ID, answer)
+}
+
+func (h *WebhookHandler) handleAskJSON(ctx context.Context, msg *Message, question string, contractName string) {
+	if question == "" {
+		h.reply(ctx, msg.Chat.ID, "Нужно задать вопрос. Отправьте текст следующим сообщением")
+		return
+	}
+
+	h.reply(ctx, msg.Chat.ID, "Думаю...")
+
+	systemPrompt, err := llmcontracts.SystemPrompt(contractName)
+	if err != nil {
+		h.logger.Error("system prompt error", slog.String("error", err.Error()))
+		h.reply(ctx, msg.Chat.ID, "Не удалось получить контракт LLM.")
+		return
+	}
+
+	answer, err := h.llm.ChatCompletionWithSystem(ctx, systemPrompt, question, "")
+	if err != nil {
+		h.logger.Error("llm error", slog.String("error", err.Error()))
+		h.reply(ctx, msg.Chat.ID, "Ошибка LLM. Попробуйте позже.")
+		return
+	}
+	h.reply(ctx, msg.Chat.ID, answer)
+
+	validation, err := llmcontracts.Validate(contractName, answer)
+	if err != nil {
+		h.logger.Error("validate error", slog.String("error", err.Error()))
+		h.reply(ctx, msg.Chat.ID, fmt.Sprintf("Ошибка валидации: %v", err))
+		return
+	}
+
+	if validation.IsValid {
+		h.reply(ctx, msg.Chat.ID, fmt.Sprintf("✅ Ответ валиден для контракта %s", contractName))
+		return
+	}
+
+	errors := validation.Errors
+	if len(errors) == 0 {
+		errors = []string{"неизвестная ошибка валидации"}
+	}
+	maxErrs := 10
+	if len(errors) > maxErrs {
+		errors = append(errors[:maxErrs], "…")
+	}
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("❌ Ответ НЕ валиден для контракта %s:\n", contractName))
+	for _, e := range errors {
+		b.WriteString("- ")
+		b.WriteString(e)
+		b.WriteString("\n")
+	}
+	h.reply(ctx, msg.Chat.ID, strings.TrimRight(b.String(), "\n"))
 }
 
 func (h *WebhookHandler) reply(ctx context.Context, chatID int64, text string) {
@@ -349,4 +429,29 @@ func (h *WebhookHandler) isAskMode(userID int64) bool {
 
 	state, ok := h.state[userID]
 	return ok && state.askMode
+}
+
+func (h *WebhookHandler) setAskJSONMode(userID int64, enabled bool, contract string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.askJSONMode = enabled
+	if enabled {
+		state.askJSONContract = contract
+	} else {
+		state.askJSONContract = ""
+	}
+	h.state[userID] = state
+}
+
+func (h *WebhookHandler) askJSONState(userID int64) (bool, string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok || !state.askJSONMode {
+		return false, ""
+	}
+	return true, state.askJSONContract
 }

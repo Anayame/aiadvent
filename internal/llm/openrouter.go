@@ -41,6 +41,10 @@ func NewOpenRouterClient(cfg config.OpenRouterConfig, httpClient *http.Client, l
 }
 
 func (c *OpenRouterClient) ChatCompletion(ctx context.Context, prompt string, model string) (string, error) {
+	return c.ChatCompletionWithSystem(ctx, "", prompt, model)
+}
+
+func (c *OpenRouterClient) ChatCompletionWithSystem(ctx context.Context, systemPrompt string, prompt string, model string) (string, error) {
 	if model == "" {
 		model = c.defaultModel
 	}
@@ -48,11 +52,15 @@ func (c *OpenRouterClient) ChatCompletion(ctx context.Context, prompt string, mo
 		return "", ErrInvalidModel
 	}
 
+	messages := make([]message, 0, 2)
+	if systemPrompt != "" {
+		messages = append(messages, message{Role: "system", Content: systemPrompt})
+	}
+	messages = append(messages, message{Role: "user", Content: prompt})
+
 	requestBody := openRouterRequest{
-		Model: model,
-		Messages: []message{
-			{Role: "user", Content: prompt},
-		},
+		Model:    model,
+		Messages: messages,
 	}
 
 	var lastErr error

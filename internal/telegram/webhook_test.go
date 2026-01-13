@@ -49,6 +49,10 @@ func (s *stubLLM) ChatCompletion(ctx context.Context, prompt string, model strin
 	return s.answer, nil
 }
 
+func (s *stubLLM) ChatCompletionWithSystem(ctx context.Context, systemPrompt string, prompt string, model string) (string, error) {
+	return s.ChatCompletion(ctx, prompt, model)
+}
+
 type slowLLM struct {
 	delay  time.Duration
 	answer string
@@ -61,6 +65,10 @@ func (s *slowLLM) ChatCompletion(ctx context.Context, prompt string, model strin
 		return "", ctx.Err()
 	}
 	return s.answer, nil
+}
+
+func (s *slowLLM) ChatCompletionWithSystem(ctx context.Context, systemPrompt string, prompt string, model string) (string, error) {
+	return s.ChatCompletion(ctx, prompt, model)
 }
 
 func TestPublicCommandDoesNotRequireAuth(t *testing.T) {
