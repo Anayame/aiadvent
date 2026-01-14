@@ -36,7 +36,15 @@ func (s *stubBot) SendMessage(ctx context.Context, chatID int64, text string) (i
 	return messageID, nil
 }
 
+func (s *stubBot) SendMessageWithKeyboard(ctx context.Context, chatID int64, text string, keyboard *InlineKeyboardMarkup) (int64, error) {
+	return s.SendMessage(ctx, chatID, text)
+}
+
 func (s *stubBot) EditMessage(ctx context.Context, chatID int64, messageID int64, text string) error {
+	return s.EditMessageKeyboard(ctx, chatID, messageID, text, nil)
+}
+
+func (s *stubBot) EditMessageKeyboard(ctx context.Context, chatID int64, messageID int64, text string, keyboard *InlineKeyboardMarkup) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -53,6 +61,10 @@ func (s *stubBot) EditMessage(ctx context.Context, chatID int64, messageID int64
 		}
 	}
 
+	return nil
+}
+
+func (s *stubBot) AnswerCallbackQuery(ctx context.Context, callbackQueryID string, text string) error {
 	return nil
 }
 

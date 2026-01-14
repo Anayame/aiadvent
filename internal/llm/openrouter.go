@@ -58,6 +58,18 @@ func (c *OpenRouterClient) ChatCompletionWithSystem(ctx context.Context, systemP
 	}
 	messages = append(messages, message{Role: "user", Content: prompt})
 
+	return c.chatCompletionWithMessages(ctx, model, messages)
+}
+
+// chatCompletionWithMessages выполняет запрос к LLM с произвольным набором сообщений.
+func (c *OpenRouterClient) chatCompletionWithMessages(ctx context.Context, model string, messages []message) (string, error) {
+	if model == "" {
+		model = c.defaultModel
+	}
+	if model == "" {
+		return "", ErrInvalidModel
+	}
+
 	requestBody := openRouterRequest{
 		Model:    model,
 		Messages: messages,

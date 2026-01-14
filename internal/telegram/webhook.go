@@ -26,10 +26,60 @@ const (
 	messagePartDelay = 100 * time.Millisecond
 )
 
+// BotCommand описывает команду бота с её описанием и требованием авторизации.
+type BotCommand struct {
+	Command     string
+	Description string
+	RequireAuth bool
+}
+
+// botCommands список всех доступных команд бота.
+var botCommands = []BotCommand{
+	{Command: "/start", Description: "Показать список команд", RequireAuth: false},
+	{Command: "/login", Description: "Войти в систему (пароль следующим сообщением)", RequireAuth: false},
+	{Command: "/logout", Description: "Выйти из системы", RequireAuth: true},
+	{Command: "/me", Description: "Показать информацию о текущем пользователе", RequireAuth: false},
+	{Command: "/ask", Description: "Режим обычных вопросов к LLM", RequireAuth: true},
+	{Command: "/ask_json", Description: "Режим JSON-ответов с контрактом", RequireAuth: true},
+	{Command: "/create_plan", Description: "Режим создания плана действий", RequireAuth: true},
+	{Command: "/model", Description: "Изменить модель LLM", RequireAuth: true},
+	{Command: "/end", Description: "Выйти из текущего режима", RequireAuth: false},
+}
+
+func formatCommandList() string {
+	var b strings.Builder
+	b.WriteString("📋 *Доступные команды:*\n\n")
+
+	// Публичные команды
+	b.WriteString("*Общие:*\n")
+	for _, cmd := range botCommands {
+		if !cmd.RequireAuth {
+			b.WriteString(fmt.Sprintf("%s — %s\n", cmd.Command, cmd.Description))
+		}
+	}
+
+	// Команды, требующие авторизации
+	b.WriteString("\n*Требуют авторизации:*\n")
+	for _, cmd := range botCommands {
+		if cmd.RequireAuth {
+			b.WriteString(fmt.Sprintf("%s — %s\n", cmd.Command, cmd.Description))
+		}
+	}
+
+	b.WriteString("\n💡 Для начала работы используйте /login")
+	return b.String()
+}
+
 type pendingCommand string
 
 const (
 	pendingCommandLogin pendingCommand = "login"
+)
+
+type dialogMode string
+
+const (
+	dialogModeCreatePlan dialogMode = "create_plan"
 )
 
 type userState struct {
@@ -37,6 +87,14 @@ type userState struct {
 	askMode         bool
 	askJSONMode     bool
 	askJSONContract string
+	dialogMode      dialogMode
+	dialogID        string
+	// Выбранная модель для режимов вопросов (пустая строка = модель по умолчанию)
+	selectedModel string
+	// Последний вопрос пользователя для повторной отправки при смене модели
+	lastQuestion string
+	// Флаг для отображения названия модели при следующем ответе
+	showModelName bool
 }
 
 type AuthService interface {
@@ -45,9 +103,17 @@ type AuthService interface {
 	IsAuthorized(ctx context.Context, userID int64) bool
 }
 
+type DialogService interface {
+	Chat(ctx context.Context, dialogID string, model string, systemPrompt string, userMessage string) (string, error)
+	ClearDialog(ctx context.Context, dialogID string) error
+	CreatePlan(ctx context.Context, dialogID string, model string, userMessage string) (string, error)
+	ReplayCreatePlan(ctx context.Context, dialogID string, model string) (string, error)
+}
+
 type WebhookDeps struct {
 	Auth          AuthService
 	LLM           llm.Client
+	DialogService DialogService
 	Bot           BotClient
 	Logger        *slog.Logger
 	AdminPassword string
@@ -62,6 +128,7 @@ type WebhookDeps struct {
 type WebhookHandler struct {
 	auth          AuthService
 	llm           llm.Client
+	dialogService DialogService
 	bot           BotClient
 	logger        *slog.Logger
 	adminPassword string
@@ -90,6 +157,7 @@ func NewWebhookHandler(deps WebhookDeps) *WebhookHandler {
 	return &WebhookHandler{
 		auth:          deps.Auth,
 		llm:           deps.LLM,
+		dialogService: deps.DialogService,
 		bot:           deps.Bot,
 		logger:        deps.Logger,
 		adminPassword: deps.AdminPassword,
@@ -114,18 +182,24 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		httpserver.WriteJSONError(w, http.StatusBadRequest, "bad_request", "cannot parse update")
 		return
 	}
-	if upd.Message == nil || upd.Message.From == nil {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	text := strings.TrimSpace(upd.Message.Text)
 
 	// Быстро отвечаем Telegram, основную обработку переносим в фон.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"ok":true}`))
 
+	// Обработка callback query от inline кнопок
+	if upd.CallbackQuery != nil && upd.CallbackQuery.From != nil {
+		h.processCallbackAsync(upd.CallbackQuery)
+		return
+	}
+
+	// Обработка обычных сообщений
+	if upd.Message == nil || upd.Message.From == nil {
+		return
+	}
+
+	text := strings.TrimSpace(upd.Message.Text)
 	h.processAsync(upd.Message, text)
 }
 
@@ -139,7 +213,7 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 
 	switch cmd {
 	case "/start":
-		h.reply(ctx, msg.Chat.ID, "Привет! Команды: /login, /ask (режим обычных вопросов), /ask_json [contract] (режим контрактных JSON-ответов), выход /end, /logout, /me. Введите команду, параметр — отдельным сообщением.")
+		h.reply(ctx, msg.Chat.ID, formatCommandList())
 	case "/login":
 		if arg == "" {
 			h.setPending(msg.From.ID, pendingCommandLogin)
@@ -186,24 +260,47 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 		h.setAskMode(msg.From.ID, false)
 		h.setAskJSONMode(msg.From.ID, true, contractName)
 		h.reply(ctx, msg.Chat.ID, fmt.Sprintf("Режим JSON-вопросов включен (контракт: %s). Отправляйте сообщения. /end выключит режим.", contractName))
+	case "/create_plan":
+		if !h.auth.IsAuthorized(ctx, msg.From.ID) {
+			h.reply(ctx, msg.Chat.ID, "Требуется авторизация. Отправьте /login, затем пароль отдельным сообщением.")
+			return
+		}
+		h.handleCreatePlanCommand(ctx, msg)
+	case "/model":
+		if !h.auth.IsAuthorized(ctx, msg.From.ID) {
+			h.reply(ctx, msg.Chat.ID, "Требуется авторизация. Отправьте /login, затем пароль отдельным сообщением.")
+			return
+		}
+		h.handleModelCommand(ctx, msg, arg)
 	case "/end":
 		ask := h.isAskMode(msg.From.ID)
 		askJSON, _ := h.askJSONState(msg.From.ID)
-		if ask || askJSON {
+		dialogActive := h.isDialogMode(msg.From.ID)
+		if ask || askJSON || dialogActive {
 			h.setAskMode(msg.From.ID, false)
 			h.setAskJSONMode(msg.From.ID, false, "")
-			h.reply(ctx, msg.Chat.ID, "Режим вопросов выключен.")
+			if dialogActive {
+				h.handleEndDialog(ctx, msg)
+			} else {
+				h.reply(ctx, msg.Chat.ID, "Режим вопросов выключен.")
+			}
 		} else {
-			h.reply(ctx, msg.Chat.ID, "Вы не в режиме вопросов. Отправьте /ask или /ask_json, чтобы начать.")
+			h.reply(ctx, msg.Chat.ID, "Вы не в режиме вопросов. Отправьте /ask, /ask_json или /create_plan, чтобы начать.")
 		}
 	default:
-		h.reply(ctx, msg.Chat.ID, "Неизвестная команда. Попробуйте /start")
+		h.reply(ctx, msg.Chat.ID, "❌ Неизвестная команда.\n\n"+formatCommandList())
 	}
 }
 
 func (h *WebhookHandler) handleText(ctx context.Context, msg *Message, text string) {
 	if !h.auth.IsAuthorized(ctx, msg.From.ID) {
 		h.reply(ctx, msg.Chat.ID, "Нужно войти: отправьте /login и затем пароль отдельным сообщением")
+		return
+	}
+
+	// Проверяем режим диалога
+	if dialogMode, dialogID := h.getDialogState(msg.From.ID); dialogMode != "" {
+		h.handleDialogMessage(ctx, msg, text, dialogMode, dialogID)
 		return
 	}
 
@@ -216,7 +313,7 @@ func (h *WebhookHandler) handleText(ctx context.Context, msg *Message, text stri
 		return
 	}
 
-	h.reply(ctx, msg.Chat.ID, "Чтобы задать вопрос, включите режим /ask или /ask_json. Команда /end выключает режим.")
+	h.reply(ctx, msg.Chat.ID, "Чтобы задать вопрос, включите режим /ask, /ask_json или /create_plan. Команда /end выключает режим.")
 }
 
 func (h *WebhookHandler) handleLogin(ctx context.Context, msg *Message, password string) {
@@ -243,6 +340,12 @@ func (h *WebhookHandler) handleAsk(ctx context.Context, msg *Message, question s
 		return
 	}
 
+	// Сохраняем последний вопрос для возможной переотправки при смене модели
+	h.setLastQuestion(msg.From.ID, question)
+
+	// Получаем выбранную модель пользователя
+	selectedModel := h.getSelectedModel(msg.From.ID)
+
 	thinkingMessageID, cancelAnimation, err := h.sendThinkingAnimation(ctx, msg.Chat.ID)
 	if err != nil {
 		h.logger.Error("send thinking animation failed", slog.String("error", err.Error()))
@@ -251,12 +354,18 @@ func (h *WebhookHandler) handleAsk(ctx context.Context, msg *Message, question s
 	}
 	defer cancelAnimation()
 
-	answer, err := h.llm.ChatCompletion(ctx, question, "")
+	answer, err := h.llm.ChatCompletion(ctx, question, selectedModel)
 	if err != nil {
 		cancelAnimation()
 		h.logger.Error("llm error", slog.String("error", err.Error()))
 		h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, "Ошибка LLM. Попробуйте позже.")
 		return
+	}
+
+	// Добавляем название модели к ответу, если это первый ответ после смены модели
+	if h.getAndClearShowModelName(msg.From.ID) && selectedModel != "" {
+		modelName := llm.GetModelName(selectedModel)
+		answer = fmt.Sprintf("*[%s]*\n\n%s", modelName, answer)
 	}
 
 	cancelAnimation()
@@ -268,6 +377,12 @@ func (h *WebhookHandler) handleAskJSON(ctx context.Context, msg *Message, questi
 		h.reply(ctx, msg.Chat.ID, "Нужно задать вопрос. Отправьте текст следующим сообщением")
 		return
 	}
+
+	// Сохраняем последний вопрос для возможной переотправки при смене модели
+	h.setLastQuestion(msg.From.ID, question)
+
+	// Получаем выбранную модель пользователя
+	selectedModel := h.getSelectedModel(msg.From.ID)
 
 	thinkingMessageID, cancelAnimation, err := h.sendThinkingAnimation(ctx, msg.Chat.ID)
 	if err != nil {
@@ -285,12 +400,18 @@ func (h *WebhookHandler) handleAskJSON(ctx context.Context, msg *Message, questi
 		return
 	}
 
-	answer, err := h.llm.ChatCompletionWithSystem(ctx, systemPrompt, question, "")
+	answer, err := h.llm.ChatCompletionWithSystem(ctx, systemPrompt, question, selectedModel)
 	if err != nil {
 		cancelAnimation()
 		h.logger.Error("llm error", slog.String("error", err.Error()))
 		h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, "Ошибка LLM. Попробуйте позже.")
 		return
+	}
+
+	// Добавляем название модели к ответу, если это первый ответ после смены модели
+	if h.getAndClearShowModelName(msg.From.ID) && selectedModel != "" {
+		modelName := llm.GetModelName(selectedModel)
+		answer = fmt.Sprintf("*[%s]*\n\n%s", modelName, answer)
 	}
 
 	cancelAnimation()
@@ -434,6 +555,51 @@ func (h *WebhookHandler) processAsync(msg *Message, text string) {
 	}(msg, text)
 }
 
+func (h *WebhookHandler) processCallbackAsync(cb *CallbackQuery) {
+	if !h.acquireSlot() {
+		return
+	}
+
+	go func(cb *CallbackQuery) {
+		defer h.releaseSlot()
+		defer func() {
+			if r := recover(); r != nil {
+				h.logger.Error("callback goroutine panic recovered", slog.Any("panic", r))
+			}
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), h.processingTTL)
+		defer cancel()
+
+		h.handleCallbackQuery(ctx, cb)
+	}(cb)
+}
+
+func (h *WebhookHandler) handleCallbackQuery(ctx context.Context, cb *CallbackQuery) {
+	// Проверяем авторизацию
+	if !h.auth.IsAuthorized(ctx, cb.From.ID) {
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "Требуется авторизация")
+		return
+	}
+
+	// Парсим callback data (формат: action:data)
+	parts := strings.SplitN(cb.Data, ":", 2)
+	if len(parts) < 2 {
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "Неверный формат данных")
+		return
+	}
+
+	action := parts[0]
+	data := parts[1]
+
+	switch action {
+	case "model":
+		h.handleModelCallback(ctx, cb, data)
+	default:
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "Неизвестное действие")
+	}
+}
+
 func (h *WebhookHandler) dispatch(ctx context.Context, msg *Message, text string) {
 	if text == "" {
 		h.reply(ctx, msg.Chat.ID, "Пустое сообщение. Используйте /start.")
@@ -560,4 +726,324 @@ func (h *WebhookHandler) askJSONState(userID int64) (bool, string) {
 		return false, ""
 	}
 	return true, state.askJSONContract
+}
+
+func (h *WebhookHandler) setDialogMode(userID int64, mode dialogMode, dialogID string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.dialogMode = mode
+	state.dialogID = dialogID
+	h.state[userID] = state
+}
+
+func (h *WebhookHandler) getDialogState(userID int64) (dialogMode, string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok || state.dialogMode == "" {
+		return "", ""
+	}
+	return state.dialogMode, state.dialogID
+}
+
+func (h *WebhookHandler) isDialogMode(userID int64) bool {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	return ok && state.dialogMode != ""
+}
+
+func (h *WebhookHandler) clearDialogMode(userID int64) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.dialogMode = ""
+	state.dialogID = ""
+	h.state[userID] = state
+}
+
+func (h *WebhookHandler) setSelectedModel(userID int64, model string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.selectedModel = model
+	h.state[userID] = state
+}
+
+func (h *WebhookHandler) getSelectedModel(userID int64) string {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok {
+		return ""
+	}
+	return state.selectedModel
+}
+
+func (h *WebhookHandler) setLastQuestion(userID int64, question string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.lastQuestion = question
+	h.state[userID] = state
+}
+
+func (h *WebhookHandler) getLastQuestion(userID int64) string {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok {
+		return ""
+	}
+	return state.lastQuestion
+}
+
+func (h *WebhookHandler) setShowModelName(userID int64, show bool) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.showModelName = show
+	h.state[userID] = state
+}
+
+func (h *WebhookHandler) getAndClearShowModelName(userID int64) bool {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok || !state.showModelName {
+		return false
+	}
+	state.showModelName = false
+	h.state[userID] = state
+	return true
+}
+
+func (h *WebhookHandler) generateDialogID(userID int64) string {
+	return fmt.Sprintf("%d:%d", userID, time.Now().UnixNano())
+}
+
+func (h *WebhookHandler) handleCreatePlanCommand(ctx context.Context, msg *Message) {
+	// Если у пользователя уже был активный диалог создания плана - удаляем его
+	if mode, dialogID := h.getDialogState(msg.From.ID); mode == dialogModeCreatePlan && dialogID != "" {
+		if h.dialogService != nil {
+			if err := h.dialogService.ClearDialog(ctx, dialogID); err != nil {
+				h.logger.Error("failed to clear old dialog", slog.String("error", err.Error()))
+			}
+		}
+	}
+
+	// Генерируем новый dialogID
+	dialogID := h.generateDialogID(msg.From.ID)
+
+	// Устанавливаем режим диалога
+	h.setDialogMode(msg.From.ID, dialogModeCreatePlan, dialogID)
+
+	h.reply(ctx, msg.Chat.ID, "Режим создания плана действий включен.\n\nОпишите, что вы хотите сделать. Я буду задавать уточняющие вопросы, чтобы собрать требования и сформировать план.\n\nЧтобы прервать диалог, отправьте /end")
+}
+
+func (h *WebhookHandler) handleEndDialog(ctx context.Context, msg *Message) {
+	mode, dialogID := h.getDialogState(msg.From.ID)
+	if mode == "" {
+		h.reply(ctx, msg.Chat.ID, "Вы не в режиме диалога.")
+		return
+	}
+
+	// Удаляем историю диалога
+	if h.dialogService != nil && dialogID != "" {
+		if err := h.dialogService.ClearDialog(ctx, dialogID); err != nil {
+			h.logger.Error("failed to clear dialog", slog.String("error", err.Error()))
+		}
+	}
+
+	// Очищаем состояние
+	h.clearDialogMode(msg.From.ID)
+
+	h.reply(ctx, msg.Chat.ID, "Режим диалога завершён. История удалена.")
+}
+
+func (h *WebhookHandler) handleModelCommand(ctx context.Context, msg *Message, arg string) {
+	currentModel := h.getSelectedModel(msg.From.ID)
+	currentModelName := "по умолчанию"
+	if currentModel != "" {
+		currentModelName = llm.GetModelName(currentModel)
+	}
+
+	// Формируем текст сообщения
+	text := fmt.Sprintf("🤖 *Текущая модель:* %s\n\n*Выберите модель:*", currentModelName)
+
+	// Создаём inline клавиатуру с кнопками моделей
+	keyboard := h.buildModelKeyboard(currentModel)
+
+	h.bot.SendMessageWithKeyboard(ctx, msg.Chat.ID, text, keyboard)
+}
+
+// buildModelKeyboard создаёт inline клавиатуру с кнопками выбора модели.
+func (h *WebhookHandler) buildModelKeyboard(currentModel string) *InlineKeyboardMarkup {
+	var rows [][]InlineKeyboardButton
+
+	for i, m := range llm.AvailableModels {
+		buttonText := m.Name
+		if m.ID == currentModel {
+			buttonText = "✓ " + buttonText
+		}
+
+		rows = append(rows, []InlineKeyboardButton{
+			{
+				Text:         buttonText,
+				CallbackData: fmt.Sprintf("model:%d", i),
+			},
+		})
+	}
+
+	return &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// handleModelCallback обрабатывает нажатие на кнопку выбора модели.
+func (h *WebhookHandler) handleModelCallback(ctx context.Context, cb *CallbackQuery, data string) {
+	// Парсим индекс модели
+	var modelIndex int
+	if _, err := fmt.Sscanf(data, "%d", &modelIndex); err != nil || modelIndex < 0 || modelIndex >= len(llm.AvailableModels) {
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "❌ Неверная модель")
+		return
+	}
+
+	selectedModel := llm.AvailableModels[modelIndex]
+	currentModel := h.getSelectedModel(cb.From.ID)
+
+	// Проверяем, не выбрана ли уже эта модель
+	if currentModel == selectedModel.ID {
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, fmt.Sprintf("Модель %s уже выбрана", selectedModel.Name))
+		return
+	}
+
+	// Устанавливаем новую модель
+	h.setSelectedModel(cb.From.ID, selectedModel.ID)
+	h.setShowModelName(cb.From.ID, true)
+
+	// Обновляем сообщение с новой клавиатурой
+	newText := fmt.Sprintf("🤖 *Текущая модель:* %s\n\n*Выберите модель:*", selectedModel.Name)
+	newKeyboard := h.buildModelKeyboard(selectedModel.ID)
+
+	if cb.Message != nil {
+		h.bot.EditMessageKeyboard(ctx, cb.Message.Chat.ID, cb.Message.MessageID, newText, newKeyboard)
+	}
+
+	// Проверяем, находимся ли мы в режиме вопросов или диалога
+	inAskMode := h.isAskMode(cb.From.ID)
+	askJSON, contract := h.askJSONState(cb.From.ID)
+	dialogMode, dialogID := h.getDialogState(cb.From.ID)
+
+	// Режим диалога create_plan - переотправляем всю историю
+	if dialogMode == dialogModeCreatePlan && dialogID != "" {
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, fmt.Sprintf("✅ %s. Переотправляю диалог...", selectedModel.Name))
+		h.handleDialogModelChange(ctx, cb, selectedModel, dialogID)
+		return
+	}
+
+	// Режим вопросов - переотправляем последний вопрос
+	if inAskMode || askJSON {
+		lastQuestion := h.getLastQuestion(cb.From.ID)
+		if lastQuestion != "" {
+			h.bot.AnswerCallbackQuery(ctx, cb.ID, fmt.Sprintf("✅ %s. Переотправляю запрос...", selectedModel.Name))
+			// Создаём виртуальное сообщение для обработки
+			msg := &Message{
+				From: cb.From,
+				Chat: cb.Message.Chat,
+			}
+			if askJSON {
+				h.handleAskJSON(ctx, msg, lastQuestion, contract)
+			} else {
+				h.handleAsk(ctx, msg, lastQuestion)
+			}
+			return
+		}
+	}
+
+	h.bot.AnswerCallbackQuery(ctx, cb.ID, fmt.Sprintf("✅ Модель: %s", selectedModel.Name))
+}
+
+// handleDialogModelChange обрабатывает смену модели в режиме диалога.
+func (h *WebhookHandler) handleDialogModelChange(ctx context.Context, cb *CallbackQuery, model llm.ModelInfo, dialogID string) {
+	if h.dialogService == nil {
+		h.reply(ctx, cb.Message.Chat.ID, "Сервис диалогов недоступен.")
+		return
+	}
+
+	thinkingMessageID, cancelAnimation, err := h.sendThinkingAnimation(ctx, cb.Message.Chat.ID)
+	if err != nil {
+		h.logger.Error("send thinking animation failed", slog.String("error", err.Error()))
+		h.reply(ctx, cb.Message.Chat.ID, "Ошибка отправки сообщения.")
+		return
+	}
+	defer cancelAnimation()
+
+	// Переотправляем диалог с новой моделью
+	answer, err := h.dialogService.ReplayCreatePlan(ctx, dialogID, model.ID)
+	if err != nil {
+		cancelAnimation()
+		h.logger.Error("replay dialog error", slog.String("error", err.Error()))
+		h.bot.EditMessage(ctx, cb.Message.Chat.ID, thinkingMessageID, "Ошибка LLM. Попробуйте позже или завершите режим командой /end")
+		return
+	}
+
+	// Добавляем название модели к ответу
+	answer = fmt.Sprintf("*[%s]*\n\n%s", model.Name, answer)
+
+	cancelAnimation()
+	h.bot.EditMessage(ctx, cb.Message.Chat.ID, thinkingMessageID, answer)
+}
+
+func (h *WebhookHandler) handleDialogMessage(ctx context.Context, msg *Message, text string, mode dialogMode, dialogID string) {
+	if h.dialogService == nil {
+		h.reply(ctx, msg.Chat.ID, "Сервис диалогов недоступен.")
+		return
+	}
+
+	// Получаем выбранную модель пользователя
+	selectedModel := h.getSelectedModel(msg.From.ID)
+
+	thinkingMessageID, cancelAnimation, err := h.sendThinkingAnimation(ctx, msg.Chat.ID)
+	if err != nil {
+		h.logger.Error("send thinking animation failed", slog.String("error", err.Error()))
+		h.reply(ctx, msg.Chat.ID, "Ошибка отправки сообщения.")
+		return
+	}
+	defer cancelAnimation()
+
+	var answer string
+	switch mode {
+	case dialogModeCreatePlan:
+		answer, err = h.dialogService.CreatePlan(ctx, dialogID, selectedModel, text)
+	default:
+		cancelAnimation()
+		h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, "Неизвестный режим диалога.")
+		return
+	}
+
+	if err != nil {
+		cancelAnimation()
+		h.logger.Error("dialog llm error", slog.String("error", err.Error()), slog.String("mode", string(mode)))
+		h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, "Ошибка LLM. Попробуйте позже или завершите режим командой /end")
+		return
+	}
+
+	// Добавляем название модели к ответу, если это первый ответ после смены модели
+	if h.getAndClearShowModelName(msg.From.ID) && selectedModel != "" {
+		modelName := llm.GetModelName(selectedModel)
+		answer = fmt.Sprintf("*[%s]*\n\n%s", modelName, answer)
+	}
+
+	cancelAnimation()
+	h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, answer)
 }

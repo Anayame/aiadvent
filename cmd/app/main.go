@@ -30,6 +30,17 @@ func main() {
 	httpClient := transport.NewHTTPClient(cfg.RequestTimeout)
 	llmClient := llm.NewOpenRouterClient(cfg.OpenRouter, httpClient, logger)
 
+	// Создаём хранилище диалогов с TTL 24 часа
+	dialogStore := llm.NewMemoryDialogStore(24 * time.Hour)
+
+	// Создаём сервис диалогов с LLM
+	dialogService := llm.NewDialogService(llm.DialogServiceConfig{
+		Client:       llmClient,
+		DialogStore:  dialogStore,
+		DefaultModel: cfg.OpenRouter.DefaultModel,
+		Logger:       logger,
+	})
+
 	var store auth.Store
 	switch strings.ToLower(cfg.AuthStoreType) {
 	case "memory":
@@ -47,6 +58,7 @@ func main() {
 	webhookHandler := telegram.NewWebhookHandler(telegram.WebhookDeps{
 		Auth:          authService,
 		LLM:           llmClient,
+		DialogService: dialogService,
 		Bot:           telegramClient,
 		Logger:        logger,
 		AdminPassword: cfg.AdminPassword,
