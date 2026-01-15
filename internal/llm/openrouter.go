@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
 	"aiadvent/internal/config"
+	"aiadvent/internal/retry"
 	"log/slog"
 )
 
@@ -23,8 +23,7 @@ type OpenRouterClient struct {
 	baseURL      string
 	defaultModel string
 	httpClient   *http.Client
-	retryCount   int
-	backoff      time.Duration
+	retryPolicy  retry.Policy
 	logger       *slog.Logger
 }
 
@@ -34,8 +33,7 @@ func NewOpenRouterClient(cfg config.OpenRouterConfig, httpClient *http.Client, l
 		baseURL:      cfg.BaseURL,
 		defaultModel: cfg.DefaultModel,
 		httpClient:   httpClient,
-		retryCount:   2,
-		backoff:      500 * time.Millisecond,
+		retryPolicy:  retry.DefaultPolicy(),
 		logger:       logger,
 	}
 }
@@ -75,63 +73,14 @@ func (c *OpenRouterClient) chatCompletionWithMessages(ctx context.Context, model
 		Messages: messages,
 	}
 
-	var lastErr error
-	for attempt := 0; attempt <= c.retryCount; attempt++ {
-		answer, err := c.doRequest(ctx, requestBody)
-		if err == nil {
-			return answer, nil
-		}
-		if !shouldRetry(err) || attempt == c.retryCount {
-			return "", err
-		}
-		lastErr = err
-		if c.logger != nil {
-			c.logger.Warn("openrouter retry",
-				slog.Int("attempt", attempt+1),
-				slog.String("error", err.Error()))
-		}
-
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(c.backoff * time.Duration(attempt+1)):
-		}
-	}
-	return "", fmt.Errorf("openrouter request failed: %w", lastErr)
-}
-
-func (c *OpenRouterClient) doRequest(ctx context.Context, body openRouterRequest) (string, error) {
-	buf, err := json.Marshal(body)
+	resp, bodyBytes, err := retry.DoHTTP(ctx, c.retryPolicy, c.logger, func(ctx context.Context) (*http.Response, []byte, error) {
+		return c.doRequest(ctx, requestBody)
+	})
 	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
+		return "", err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/chat/completions", c.baseURL), bytes.NewReader(buf))
-	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
-		return "", &transientError{status: resp.StatusCode, body: string(bodyBytes)}
-	}
-
-	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(bodyBytes))
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("unexpected status %d: %s", resp.StatusCode, snippet(bodyBytes, 200))
 	}
 
 	var parsed openRouterResponse
@@ -144,12 +93,33 @@ func (c *OpenRouterClient) doRequest(ctx context.Context, body openRouterRequest
 	return parsed.Choices[0].Message.Content, nil
 }
 
-func shouldRetry(err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return false
+func (c *OpenRouterClient) doRequest(ctx context.Context, body openRouterRequest) (*http.Response, []byte, error) {
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal request: %w", err)
 	}
-	var te *transientError
-	return errors.As(err, &te)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/chat/completions", c.baseURL), bytes.NewReader(buf))
+	if err != nil {
+		return nil, nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp, nil, fmt.Errorf("read response: %w", err)
+	}
+
+	return resp, bodyBytes, nil
 }
 
 type openRouterRequest struct {
@@ -168,11 +138,12 @@ type openRouterResponse struct {
 	} `json:"choices"`
 }
 
-type transientError struct {
-	status int
-	body   string
-}
-
-func (e *transientError) Error() string {
-	return fmt.Sprintf("transient status %d: %s", e.status, e.body)
+func snippet(body []byte, limit int) string {
+	if len(body) == 0 || limit <= 0 {
+		return ""
+	}
+	if len(body) <= limit {
+		return string(body)
+	}
+	return string(body[:limit])
 }
