@@ -3,7 +3,10 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,6 +16,7 @@ import (
 	"aiadvent/internal/httpserver"
 	"aiadvent/internal/llm"
 	"aiadvent/internal/llmcontracts"
+	"aiadvent/internal/retry"
 	"log/slog"
 )
 
@@ -93,6 +97,8 @@ type userState struct {
 	selectedModel string
 	// Последний вопрос пользователя для повторной отправки при смене модели
 	lastQuestion string
+	// Последнее сообщение в режиме диалога для повторной отправки
+	lastDialogMessage string
 	// Флаг для отображения названия модели при следующем ответе
 	showModelName bool
 }
@@ -119,6 +125,7 @@ type WebhookDeps struct {
 	AdminPassword string
 	SessionTTL    time.Duration
 	WebhookSecret string
+	DefaultModel  string
 	// Необязательные настройки параллельной обработки.
 	ProcessingTimeout time.Duration
 	AcquireTimeout    time.Duration
@@ -133,6 +140,7 @@ type WebhookHandler struct {
 	logger        *slog.Logger
 	adminPassword string
 	webhookSecret string
+	defaultModel  string
 	sem           chan struct{}
 	processingTTL time.Duration
 	acquireTTL    time.Duration
@@ -162,6 +170,7 @@ func NewWebhookHandler(deps WebhookDeps) *WebhookHandler {
 		logger:        deps.Logger,
 		adminPassword: deps.AdminPassword,
 		webhookSecret: deps.WebhookSecret,
+		defaultModel:  deps.DefaultModel,
 		sem:           make(chan struct{}, maxWorkers),
 		processingTTL: processingTTL,
 		acquireTTL:    acquireTTL,
@@ -358,6 +367,9 @@ func (h *WebhookHandler) handleAsk(ctx context.Context, msg *Message, question s
 	if err != nil {
 		cancelAnimation()
 		h.logger.Error("llm error", slog.String("error", err.Error()))
+		if h.handleRetryableLLMError(ctx, msg, thinkingMessageID, err, "retry:ask") {
+			return
+		}
 		h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, "Ошибка LLM. Попробуйте позже.")
 		return
 	}
@@ -404,6 +416,9 @@ func (h *WebhookHandler) handleAskJSON(ctx context.Context, msg *Message, questi
 	if err != nil {
 		cancelAnimation()
 		h.logger.Error("llm error", slog.String("error", err.Error()))
+		if h.handleRetryableLLMError(ctx, msg, thinkingMessageID, err, "retry:ask_json") {
+			return
+		}
 		h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, "Ошибка LLM. Попробуйте позже.")
 		return
 	}
@@ -503,6 +518,75 @@ func (h *WebhookHandler) reply(ctx context.Context, chatID int64, text string) {
 	h.sendMessageWithChunks(ctx, chatID, text)
 }
 
+func (h *WebhookHandler) handleRetryableLLMError(ctx context.Context, msg *Message, messageID int64, err error, retryAction string) bool {
+	text, ok := retryErrorMessage(err)
+	if !ok {
+		return false
+	}
+	keyboard := retryKeyboard(retryAction)
+	if editErr := h.bot.EditMessageKeyboard(ctx, msg.Chat.ID, messageID, text, keyboard); editErr != nil {
+		h.reply(ctx, msg.Chat.ID, text)
+	}
+	return true
+}
+
+func retryErrorMessage(err error) (string, bool) {
+	var exhausted *retry.ExhaustedError
+	if !errors.As(err, &exhausted) {
+		return "", false
+	}
+	reason := humanRetryReason(exhausted.Cause)
+	if reason == "" {
+		reason = "Временная ошибка LLM."
+	}
+	return fmt.Sprintf("%s Я попробовал %d раз, но ответ не получен. Нажмите «Повторить запрос», чтобы попробовать снова.", reason, exhausted.Attempts), true
+}
+
+func humanRetryReason(err error) string {
+	var statusErr *retry.HTTPStatusError
+	if errors.As(err, &statusErr) {
+		switch statusErr.StatusCode {
+		case http.StatusTooManyRequests:
+			return "Сервис временно ограничил частоту запросов (429)."
+		case http.StatusRequestTimeout:
+			return "Истекло время ожидания ответа (408)."
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return "Провайдер LLM временно недоступен (5xx)."
+		default:
+			return fmt.Sprintf("Временная ошибка сервиса (HTTP %d).", statusErr.StatusCode)
+		}
+	}
+	if isTransientNetError(err) {
+		return "Временная ошибка сети при обращении к LLM."
+	}
+	return ""
+}
+
+func isTransientNetError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout() || netErr.Temporary()
+	}
+	errMsg := strings.ToLower(err.Error())
+	return strings.Contains(errMsg, "connection reset")
+}
+
+func retryKeyboard(action string) *InlineKeyboardMarkup {
+	return &InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{
+				{Text: "🔁 Повторить запрос", CallbackData: action},
+			},
+		},
+	}
+}
+
 // sendThinkingAnimation отправляет анимированное сообщение "Думаю" с бегающими точками
 func (h *WebhookHandler) sendThinkingAnimation(ctx context.Context, chatID int64) (int64, context.CancelFunc, error) {
 	messageID, err := h.bot.SendMessage(ctx, chatID, "Думаю")
@@ -595,6 +679,8 @@ func (h *WebhookHandler) handleCallbackQuery(ctx context.Context, cb *CallbackQu
 	switch action {
 	case "model":
 		h.handleModelCallback(ctx, cb, data)
+	case "retry":
+		h.handleRetryCallback(ctx, cb, data)
 	default:
 		h.bot.AnswerCallbackQuery(ctx, cb.ID, "Неизвестное действие")
 	}
@@ -735,6 +821,7 @@ func (h *WebhookHandler) setDialogMode(userID int64, mode dialogMode, dialogID s
 	state := h.state[userID]
 	state.dialogMode = mode
 	state.dialogID = dialogID
+	state.lastDialogMessage = ""
 	h.state[userID] = state
 }
 
@@ -764,6 +851,7 @@ func (h *WebhookHandler) clearDialogMode(userID int64) {
 	state := h.state[userID]
 	state.dialogMode = ""
 	state.dialogID = ""
+	state.lastDialogMessage = ""
 	h.state[userID] = state
 }
 
@@ -805,6 +893,26 @@ func (h *WebhookHandler) getLastQuestion(userID int64) string {
 		return ""
 	}
 	return state.lastQuestion
+}
+
+func (h *WebhookHandler) setLastDialogMessage(userID int64, message string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.lastDialogMessage = message
+	h.state[userID] = state
+}
+
+func (h *WebhookHandler) getLastDialogMessage(userID int64) string {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok {
+		return ""
+	}
+	return state.lastDialogMessage
 }
 
 func (h *WebhookHandler) setShowModelName(userID int64, show bool) {
@@ -874,16 +982,20 @@ func (h *WebhookHandler) handleEndDialog(ctx context.Context, msg *Message) {
 
 func (h *WebhookHandler) handleModelCommand(ctx context.Context, msg *Message, arg string) {
 	currentModel := h.getSelectedModel(msg.From.ID)
+	displayModel := currentModel
+	if displayModel == "" {
+		displayModel = h.defaultModel
+	}
 	currentModelName := "по умолчанию"
-	if currentModel != "" {
-		currentModelName = llm.GetModelName(currentModel)
+	if displayModel != "" {
+		currentModelName = llm.GetModelName(displayModel)
 	}
 
 	// Формируем текст сообщения
 	text := fmt.Sprintf("🤖 *Текущая модель:* %s\n\n*Выберите модель:*", currentModelName)
 
 	// Создаём inline клавиатуру с кнопками моделей
-	keyboard := h.buildModelKeyboard(currentModel)
+	keyboard := h.buildModelKeyboard(displayModel)
 
 	h.bot.SendMessageWithKeyboard(ctx, msg.Chat.ID, text, keyboard)
 }
@@ -973,6 +1085,49 @@ func (h *WebhookHandler) handleModelCallback(ctx context.Context, cb *CallbackQu
 	h.bot.AnswerCallbackQuery(ctx, cb.ID, fmt.Sprintf("✅ Модель: %s", selectedModel.Name))
 }
 
+func (h *WebhookHandler) handleRetryCallback(ctx context.Context, cb *CallbackQuery, data string) {
+	if cb.Message == nil {
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "Нет сообщения для повтора")
+		return
+	}
+	lastQuestion := h.getLastQuestion(cb.From.ID)
+	switch data {
+	case "ask":
+		if lastQuestion == "" {
+			h.bot.AnswerCallbackQuery(ctx, cb.ID, "Нет запроса для повтора")
+			return
+		}
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "Повторяю запрос...")
+		msg := &Message{From: cb.From, Chat: cb.Message.Chat}
+		h.handleAsk(ctx, msg, lastQuestion)
+	case "ask_json":
+		askJSON, contract := h.askJSONState(cb.From.ID)
+		if !askJSON || contract == "" {
+			h.bot.AnswerCallbackQuery(ctx, cb.ID, "Режим JSON выключен")
+			return
+		}
+		if lastQuestion == "" {
+			h.bot.AnswerCallbackQuery(ctx, cb.ID, "Нет запроса для повтора")
+			return
+		}
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "Повторяю запрос...")
+		msg := &Message{From: cb.From, Chat: cb.Message.Chat}
+		h.handleAskJSON(ctx, msg, lastQuestion, contract)
+	case "dialog":
+		mode, dialogID := h.getDialogState(cb.From.ID)
+		lastDialogMessage := h.getLastDialogMessage(cb.From.ID)
+		if mode == "" || dialogID == "" || lastDialogMessage == "" {
+			h.bot.AnswerCallbackQuery(ctx, cb.ID, "Нет активного диалога для повтора")
+			return
+		}
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "Повторяю запрос...")
+		msg := &Message{From: cb.From, Chat: cb.Message.Chat}
+		h.handleDialogMessage(ctx, msg, lastDialogMessage, mode, dialogID)
+	default:
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "Неизвестное действие")
+	}
+}
+
 // handleDialogModelChange обрабатывает смену модели в режиме диалога.
 func (h *WebhookHandler) handleDialogModelChange(ctx context.Context, cb *CallbackQuery, model llm.ModelInfo, dialogID string) {
 	if h.dialogService == nil {
@@ -1010,6 +1165,8 @@ func (h *WebhookHandler) handleDialogMessage(ctx context.Context, msg *Message, 
 		return
 	}
 
+	h.setLastDialogMessage(msg.From.ID, text)
+
 	// Получаем выбранную модель пользователя
 	selectedModel := h.getSelectedModel(msg.From.ID)
 
@@ -1034,6 +1191,9 @@ func (h *WebhookHandler) handleDialogMessage(ctx context.Context, msg *Message, 
 	if err != nil {
 		cancelAnimation()
 		h.logger.Error("dialog llm error", slog.String("error", err.Error()), slog.String("mode", string(mode)))
+		if h.handleRetryableLLMError(ctx, msg, thinkingMessageID, err, "retry:dialog") {
+			return
+		}
 		h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, "Ошибка LLM. Попробуйте позже или завершите режим командой /end")
 		return
 	}

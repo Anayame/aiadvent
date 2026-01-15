@@ -68,6 +68,19 @@ func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("transient status %d: %s", e.StatusCode, e.BodySnippet)
 }
 
+type ExhaustedError struct {
+	Cause    error
+	Attempts int
+}
+
+func (e *ExhaustedError) Error() string {
+	return fmt.Sprintf("retry attempts exhausted after %d: %v", e.Attempts, e.Cause)
+}
+
+func (e *ExhaustedError) Unwrap() error {
+	return e.Cause
+}
+
 func DoHTTP(ctx context.Context, policy Policy, logger *slog.Logger, do func(ctx context.Context) (*http.Response, []byte, error)) (*http.Response, []byte, error) {
 	policy = withDefaults(policy)
 
@@ -79,6 +92,9 @@ func DoHTTP(ctx context.Context, policy Policy, logger *slog.Logger, do func(ctx
 		resp, body, err := do(ctx)
 		if err != nil {
 			if !isRetryableNetErr(ctx, err) || attempt == policy.MaxAttempts {
+				if attempt == policy.MaxAttempts && isRetryableNetErr(ctx, err) {
+					return resp, body, &ExhaustedError{Cause: err, Attempts: attempt}
+				}
 				return resp, body, err
 			}
 			delay := policy.jitterDelay(policy.backoffDelay(attempt))
@@ -98,7 +114,10 @@ func DoHTTP(ctx context.Context, policy Policy, logger *slog.Logger, do func(ctx
 		if isRetryableStatus(status) {
 			snippet := bodySnippet(body, policy.SnippetLimit)
 			if attempt == policy.MaxAttempts {
-				return resp, body, &HTTPStatusError{StatusCode: status, BodySnippet: snippet}
+				return resp, body, &ExhaustedError{
+					Cause:    &HTTPStatusError{StatusCode: status, BodySnippet: snippet},
+					Attempts: attempt,
+				}
 			}
 
 			retryAfter, usedRetryAfter := parseRetryAfter(resp.Header, policy.Now())

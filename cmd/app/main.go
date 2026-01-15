@@ -64,6 +64,7 @@ func main() {
 		AdminPassword: cfg.AdminPassword,
 		SessionTTL:    cfg.SessionTTL,
 		WebhookSecret: cfg.Telegram.WebhookSecret,
+		DefaultModel:  cfg.OpenRouter.DefaultModel,
 	})
 
 	router := httpserver.NewRouter(httpserver.RouterDeps{
