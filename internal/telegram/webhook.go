@@ -36,44 +36,117 @@ type BotCommand struct {
 	Command     string
 	Description string
 	RequireAuth bool
+	DayNumber   int // Номер дня (0 = без привязки к дню)
 }
 
 // botCommands список всех доступных команд бота.
 var botCommands = []BotCommand{
-	{Command: "/start", Description: "Показать список команд", RequireAuth: false},
-	{Command: "/login", Description: "Войти в систему (пароль следующим сообщением)", RequireAuth: false},
-	{Command: "/logout", Description: "Выйти из системы", RequireAuth: true},
-	{Command: "/me", Description: "Показать информацию о текущем пользователе", RequireAuth: false},
-	{Command: "/ask", Description: "Режим обычных вопросов к LLM", RequireAuth: true},
-	{Command: "/ask_json", Description: "Режим JSON-ответов с контрактом", RequireAuth: true},
-	{Command: "/create_plan", Description: "Режим создания плана действий", RequireAuth: true},
-	{Command: "/solve", Description: "Варианты решения задачи. 1 - прямой ответ, 2 - пошаговое решение, 3 - промт, 4 - группа экспертов.", RequireAuth: true},
-	{Command: "/model", Description: "Изменить модель LLM", RequireAuth: true},
-	{Command: "/end", Description: "Выйти из текущего режима", RequireAuth: false},
+	{Command: "/start", Description: "Показать список команд", RequireAuth: false, DayNumber: 0},
+	{Command: "/login", Description: "Войти в систему (пароль следующим сообщением)", RequireAuth: false, DayNumber: 0},
+	//{Command: "/logout", Description: "Выйти из системы", RequireAuth: true},
+	//{Command: "/me", Description: "Показать информацию о текущем пользователе", RequireAuth: false},
+	{Command: "/ask", Description: "Режим обычных вопросов к LLM", RequireAuth: true, DayNumber: 1},
+	{Command: "/ask_json", Description: "Режим JSON-ответов с контрактом", RequireAuth: true, DayNumber: 2},
+	{Command: "/create_plan", Description: "Режим создания плана действий", RequireAuth: true, DayNumber: 3},
+	{Command: "/solve", Description: "Варианты решения задачи. 1 - прямой ответ, 2 - пошаговое решение, 3 - промт, 4 - группа экспертов.", RequireAuth: true, DayNumber: 4},
+	{Command: "/model", Description: "Изменить модель LLM", RequireAuth: true, DayNumber: 3},
+	{Command: "/end", Description: "Выйти из текущего режима", RequireAuth: false, DayNumber: 0},
 }
 
-func formatCommandList() string {
-	var b strings.Builder
-	b.WriteString("📋 *Доступные команды:*\n\n")
+func formatCommandList() []string {
+	var messages []string
 
-	// Публичные команды
-	b.WriteString("*Общие:*\n")
-	for _, cmd := range botCommands {
-		if !cmd.RequireAuth {
-			b.WriteString(fmt.Sprintf("%s — %s\n", cmd.Command, cmd.Description))
-		}
-	}
-
-	// Команды, требующие авторизации
-	b.WriteString("\n*Требуют авторизации:*\n")
+	// Разделяем команды на публичные и требующие авторизации
+	var publicCommands []BotCommand
+	var authCommands []BotCommand
 	for _, cmd := range botCommands {
 		if cmd.RequireAuth {
-			b.WriteString(fmt.Sprintf("%s — %s\n", cmd.Command, cmd.Description))
+			authCommands = append(authCommands, cmd)
+		} else {
+			publicCommands = append(publicCommands, cmd)
 		}
 	}
 
-	b.WriteString("\n💡 Для начала работы используйте /login")
-	return b.String()
+	// Функция для получения отсортированных номеров дней
+	getSortedDays := func(commands []BotCommand) []int {
+		dayNumbers := make(map[int]bool)
+		for _, cmd := range commands {
+			if cmd.DayNumber > 0 {
+				dayNumbers[cmd.DayNumber] = true
+			}
+		}
+		var sortedDays []int
+		for day := range dayNumbers {
+			sortedDays = append(sortedDays, day)
+		}
+		// Простая сортировка вставками
+		for i := 1; i < len(sortedDays); i++ {
+			for j := i; j > 0 && sortedDays[j-1] > sortedDays[j]; j-- {
+				sortedDays[j], sortedDays[j-1] = sortedDays[j-1], sortedDays[j]
+			}
+		}
+		return sortedDays
+	}
+
+	// Функция для формирования сообщения с командами
+	formatCommands := func(commands []BotCommand, dayNumber int) string {
+		var b strings.Builder
+		for _, cmd := range commands {
+			if cmd.DayNumber == dayNumber {
+				b.WriteString(fmt.Sprintf("%s — %s\n", cmd.Command, cmd.Description))
+			}
+		}
+		return strings.TrimRight(b.String(), "\n")
+	}
+
+	// 1. Сообщение с общими командами
+	if len(publicCommands) > 0 {
+		var b strings.Builder
+		b.WriteString("📋 Доступные команды:\n\n👥 Общие:\n\n")
+
+		// Сначала команды по дням
+		sortedDays := getSortedDays(publicCommands)
+		for _, day := range sortedDays {
+			b.WriteString(fmt.Sprintf("📅 День %d\n\n", day))
+			b.WriteString(formatCommands(publicCommands, day))
+		}
+
+		// Затем команды без дня
+		noDayCommands := formatCommands(publicCommands, 0)
+		if noDayCommands != "" {
+			if len(sortedDays) > 0 {
+				b.WriteString("\n\n")
+			}
+			b.WriteString(noDayCommands)
+		}
+
+		messages = append(messages, b.String())
+	}
+
+	// 2. Заголовок "Требуют авторизации"
+	if len(authCommands) > 0 {
+		messages = append(messages, "🔐 Требуют авторизации:")
+
+		// 3. Каждый день - отдельное сообщение
+		sortedDays := getSortedDays(authCommands)
+		for _, day := range sortedDays {
+			var b strings.Builder
+			b.WriteString(fmt.Sprintf("📅 День %d\n\n", day))
+			b.WriteString(formatCommands(authCommands, day))
+			messages = append(messages, b.String())
+		}
+
+		// 4. Команды без дня - отдельное сообщение
+		noDayCommands := formatCommands(authCommands, 0)
+		if noDayCommands != "" {
+			messages = append(messages, noDayCommands)
+		}
+	}
+
+	// 5. Финальное сообщение
+	messages = append(messages, "💡 Для начала работы используйте /login")
+
+	return messages
 }
 
 type pendingCommand string
@@ -236,7 +309,10 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 
 	switch cmd {
 	case "/start":
-		h.reply(ctx, msg.Chat.ID, formatCommandList())
+		messages := formatCommandList()
+		for _, message := range messages {
+			h.reply(ctx, msg.Chat.ID, message)
+		}
 	case "/login":
 		if arg == "" {
 			h.setPending(msg.From.ID, pendingCommandLogin)
@@ -319,7 +395,11 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 			h.reply(ctx, msg.Chat.ID, "Вы не в режиме вопросов. Отправьте /ask, /ask_json, /create_plan или /solve, чтобы начать.")
 		}
 	default:
-		h.reply(ctx, msg.Chat.ID, "❌ Неизвестная команда.\n\n"+formatCommandList())
+		h.reply(ctx, msg.Chat.ID, "❌ Неизвестная команда.")
+		messages := formatCommandList()
+		for _, message := range messages {
+			h.reply(ctx, msg.Chat.ID, message)
+		}
 	}
 }
 
@@ -1455,7 +1535,7 @@ func (h *WebhookHandler) runSolveStepAnimation(chatID int64, msgID int64, step i
 				}
 			}
 
-			text := fmt.Sprintf("%s *%d. %s*\n\n⏱ %s %s%s", icon, step, label, elapsed, states[i], attemptText)
+			text := fmt.Sprintf("%s *%d. %s*\n\n⏱ %s%s %s", icon, step, label, elapsed, attemptText, states[i])
 
 			editCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			// Игнорируем ошибки редактирования - продолжаем анимацию
@@ -1517,7 +1597,12 @@ func (h *WebhookHandler) handleSolveRetryCallback(ctx context.Context, cb *Callb
 	previousModel := h.getSolveStepModel(cb.From.ID, step)
 
 	if action == "same" {
-		model = h.getSolveModel(cb.From.ID)
+		// Используем последнюю модель для этого этапа, если она была
+		model = previousModel
+		if model == "" {
+			// Если этап ещё не выполнялся, используем первоначальную модель
+			model = h.getSolveModel(cb.From.ID)
+		}
 		h.bot.AnswerCallbackQuery(ctx, cb.ID, "🔁 Повторяю запрос...")
 	} else {
 		model = llm.GetRandomModelExcept(previousModel)
@@ -1610,7 +1695,7 @@ func (h *WebhookHandler) runSolveStepAnimationWithModel(chatID int64, msgID int6
 				}
 			}
 
-			text := fmt.Sprintf("%s *%d. %s*\n\n⏱ %s %s%s\n🤖 _%s_", icon, step, label, elapsed, states[i], attemptText, modelName)
+			text := fmt.Sprintf("%s *%d. %s*\n\n⏱ %s%s %s\n🤖 _%s_", icon, step, label, elapsed, attemptText, states[i], modelName)
 
 			editCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			// Игнорируем ошибки редактирования - продолжаем анимацию

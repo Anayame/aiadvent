@@ -1,12 +1,13 @@
-# Go каркас: Auth + LLM (OpenRouter) + Telegram Webhook
+# AIAdvent — Telegram + OpenRouter + Auth
 
 ## Что это
-Минимальный, но production-friendly каркас Go-приложения (один бинарник) c тремя сервисами:
-- Auth Service: простой парольный логин, in-memory сессии с TTL, интерфейс для замены на внешнее хранилище.
-- LLM Service: клиент OpenRouter с ретраями (408/429/5xx и временные сетевые ошибки, поддержка Retry-After), таймаутом и конфигом модели по умолчанию.
-- Telegram Webhook Service: обработка команд бота и проксирование запросов к LLM.
+AIAdvent — это один бинарник на Go (>= 1.22) с тремя основными сервисами, готовый к деплою на Fly.io или любом другом хостинге:
 
-Используются Go >= 1.22, `chi` для роутинга и стандартный `slog` для логов.
+- **Auth Service** — парольная авторизация, сессии с TTL и возможностью выбора хранилища (`memory` | `file`). Залогиненный пользователь получает доступ к режимам Telegram-бота.
+- **LLM Service** — обёртка вокруг OpenRouter с политикой ретраев (408/429/5xx + сетевые ошибки, jitter/backoff, `Retry-After`) и таймаутом HTTP-клиента. Позволяет запускать диалоги, создавать планы, валидировать JSON-ответы по контракту и собирать несколько вариантов решения задачи.
+- **Telegram Webhook Service** — асинхронная обработка обновлений, ограничение количества параллельных воркеров, разбивка длинных ответов, кнопки для выбора модели и управление состоянием диалога (режим `/ask`, `/ask_json`, `/create_plan`, `/solve`).
+
+Дополнительно используются `chi` для роутинга, `slog` для логов, собственные middleware (request-id, logging, recover), клиент Telegram API и HTTP-клиент с таймаутом.
 
 ## Быстрый старт
 ```bash
@@ -15,66 +16,98 @@ make run               # go run ./cmd/app
 ```
 
 Другие команды:
-- `make test` — запустить тесты
+- `make test` — запуск юнит-тестов
 - `make lint` — базовая проверка (go vet)
-- `make build` — собрать бинарник в `bin/app`
+- `make build` — сборка в `bin/app`
 
 ## Переменные окружения
-- `HTTP_ADDR` — адрес HTTP-сервера, по умолчанию `:8080`
+- `HTTP_ADDR` / `PORT` — адрес HTTP-сервера (`:8080` по умолчанию, `PORT` переопределяет `HTTP_ADDR`)
 - `LOG_LEVEL` — `debug|info|warn|error`, по умолчанию `info`
 - `ADMIN_PASSWORD` — пароль для `/login`
-- `SESSION_TTL` — длительность жизни сессии, например `2h`; значение `0` делает сессии бессрочными
-- `AUTH_STORE_TYPE` — `file|memory`, по умолчанию `file`
-- `AUTH_STORE_PATH` — путь к файлу сессий для `file` store, по умолчанию `/data/auth_sessions.json`
+- `SESSION_TTL` — время жизни сессии (`2h` по умолчанию, `0` — бессрочно)
+- `AUTH_STORE_TYPE` — `file` или `memory` (по умолчанию `file`)
+- `AUTH_STORE_PATH` — путь к файлу сессий (`/data/auth_sessions.json`)
+- `HTTP_CLIENT_TIMEOUT` — таймаут для всего HTTP-клиента (по умолчанию `180s`)
 - `OPENROUTER_API_KEY` — ключ OpenRouter
-- `OPENROUTER_BASE_URL` — базовый URL, по умолчанию `https://openrouter.ai/api/v1`
-- `OPENROUTER_DEFAULT_MODEL` — модель по умолчанию, обязательна для LLM
+- `OPENROUTER_BASE_URL` — `https://openrouter.ai/api/v1` по умолчанию
+- `OPENROUTER_DEFAULT_MODEL` — обязательная модель по умолчанию
 - `TELEGRAM_BOT_TOKEN` — токен бота
-- `TELEGRAM_API_BASE_URL` — базовый URL Telegram API, по умолчанию `https://api.telegram.org`
-- `TELEGRAM_WEBHOOK_SECRET` — секрет заголовка `X-Telegram-Bot-Api-Secret-Token` (если пустой — проверка отключена)
+- `TELEGRAM_API_BASE_URL` — `https://api.telegram.org` по умолчанию
+- `TELEGRAM_WEBHOOK_SECRET` — проверка заголовка `X-Telegram-Bot-Api-Secret-Token`; пусто = отключена проверка
 
-## HTTP эндпоинты
-- `GET /ping` — health-check, 200 OK
-- `POST /telegram/webhook` — прием Telegram update, опционально проверяется `X-Telegram-Bot-Api-Secret-Token`
+## HTTP-эндпоинты
+- `GET /ping` — health-check, возвращает `pong`
+- `POST /telegram/webhook` — приём обновлений Telegram; сразу отвечает `{"ok":true}`, основная работа выполняется в фоне
 
-Формат ошибок (JSON):
+Если секрет задан, `X-Telegram-Bot-Api-Secret-Token` обязателен; ошибки возвращаются в формате:
 ```json
 { "error": { "code": "forbidden", "message": "invalid webhook secret" } }
 ```
 
-## Команды бота
-- `/start` — приветствие и подсказка
-- `/login <password>` — вход; пароль сверяется с `ADMIN_PASSWORD`
-- `/logout` — выход, удаление сессии
-- `/me` — показать telegram user id и статус авторизации
-- `/ask <текст>` — запрос к LLM (требует авторизации)
-- Просто текст без команды:
-  - если авторизован — трактуется как `/ask <text>`
-  - иначе — подсказка залогиниться
+## Telegram: команды и режимы
 
-## Примеры запросов
-Health-check:
-```bash
-curl -i http://localhost:8080/ping
-```
+Бот живёт в контекстном состоянии: pending-команда для `/login`, режим `/ask`, `/ask_json`, `/create_plan` или `/solve`, выбранная модель, последний вопрос и сохранённая задача. Состояние хранится в памяти и синхронизируется между запросами.
 
-Имитация Telegram webhook (секрет можно опустить, если не задан):
-```bash
-curl -i -X POST http://localhost:8080/telegram/webhook \
-  -H "Content-Type: application/json" \
-  -H "X-Telegram-Bot-Api-Secret-Token: your-secret" \
-  -d '{"message":{"message_id":1,"text":"/start","chat":{"id":123},"from":{"id":123,"username":"tester"}}}'
-```
+Команды:
+
+- `/start` — список команд
+- `/login <пароль>` — авторизация; без аргумента запрашивает пароль следующим сообщением
+- `/logout` — выход, чистка режимов
+- `/me` — ID пользователя и статус авторизации
+- `/ask <текст>` / свободный текст — обычные вопросы LLM; после `/ask` бот остаётся в режиме и принимает следующие сообщения
+- `/ask_json [контракт]` — режим ответа по контракту (`llmcontracts.DefaultContract()` по умолчанию); валидируется JSON `STRICT_JSON_V3`, пользователь получает ошибки разбора
+- `/create_plan` — запуск планирования через системный промпт `SYSTEM_PROMPT_CREATE_PLAN`, можно переключать модель и повторно отправлять историю
+- `/solve` — интерактивный режим решения задачи: выбирается модель (клавиатура), поступают варианты:
+  1. прямой ответ,
+  2. пошаговое решение,
+  3. сгенерированный промт,
+  4. группа экспертов.
+  Каждая стадия запускается параллельно или повторно через кнопки, при необходимости можно выбрать другой модел и переотправить шаг
+- `/model` — выбор модели из `internal/llm/models.go`, сохраняется per-user; можно повторно отправить последний вопрос после смены модели
+- `/end` — выход из текущего режима
+
+Если пользователь не в режиме, бот напоминает про `/ask`, `/ask_json`, `/create_plan` или `/solve`. При каждом запросе бот отправляет «thinking animation», разбивая длинные ответы на отрезки по 4096 символов с задержкой 100 мс, чтобы не вызывать ограничение Telegram.
+
+## Диалоговый поток, контракты и решения
+
+`DialogService` управляет историей сообщений (TTL 24 часа) через `llm.NewMemoryDialogStore` и позволяет:
+
+- сохранять пользовательские и ответы LLM (`Chat`), поддерживая транзакционность при ошибках;
+- переключаться между моделями и переигрывать последний ответ `/create_plan`;
+- запускать *параллельные* этапы `/solve` с разными системными промптами (`SYSTEM_PROMPT_STEP_BY_STEP`, `SYSTEM_PROMPT_CREATE_PROMPT`, `SYSTEM_PROMPT_GROUP_EXPERT`), возвращая результаты через `SolutionStepCallback`;
+- повторно выполнять конкретный шаг `/solve` с другой моделью через `ExecuteSolutionStep`;
+- валидировать JSON-ответы `/ask_json` через `internal/llmcontracts.Validate`, показывая диагностические ошибки.
+
+Контрактная валидация печатает canonical JSON, а при нарушении контрактов ответ просто не сохраняется и пользователю отправляется список проблем.
+
+## Работа с LLM и устойчивость
+
+`OpenRouterClient` использует HTTP-клиент с таймаутом из конфига и `retry.Policy` (jitter + экспоненциальный backoff). `retry.DoHTTP`:
+
+- повторяет 408/429/5xx и временные сетевые ошибки (`context.DeadlineExceeded`, `io.EOF`, `syscall.ECONNRESET`),
+- уважает заголовок `Retry-After`,
+- сообщает `AttemptCallback`, чтобы `WebhookHandler` мог редактировать сообщение «уже в работе» и показывать прогресс,
+- возвращает `retry.ExhaustedError`, на котором `/telegram/webhook` рисует объяснение и кнопку «повторить».
+
+Доступность моделей ограничена списком `internal/llm/models.go`, `/model` показывает краткое описание и позволяет переключиться на следующую модель, сохраняя последний вопрос.
+
+## Список изменений по этапам
+
+- **day-1** (`Initial commit. Day 1`) — базовый Go-каркас: конфиг из env, middleware, HTTP-сервер с `chi`, Auth Service с TTL-сессиями, OpenRouter-клиент, Telegram webhook с `/start`, `/login`, `/ask` и обработкой обновлений, базовые тесты и транспорт.
+- **day-2** (`feature/day-2`) — двухшаговые команды (пароль отдельным сообщением), непрерывный режим вопросов (`/ask` остаётся включённым), сохранение сессий в файл и разбивка длинных ответов, контрактный режим `/ask_json` с валидацией, поддержка режима вопросов до `/end`.
+- **day-3** (`feature/day-3`) — `DialogService` с историей и `/create_plan`, улучшенные ретраи OpenRouter (jitter, `Retry-After`), добавлена понятная обработка `retry attempts exhausted` с возможностью повторной отправки.
+- **day-4** (`feature/day-4`) — режим `/solve` с выбором модели, четырьмя вариантами решений (прямой ответ, пошаговое решение, генерация промта, группа экспертов), inline-кнопками для повторных попыток и хранением состояния каждой стадии.
 
 ## Структура проекта
-- `cmd/app` — точка входа
-- `internal/config` — загрузка конфигурации из env
-- `internal/httpserver` — chi-роутер, middleware, health
-- `internal/middleware` — request-id, логирование, recover
-- `internal/auth` — сервис аутентификации и in-memory хранилище сессий
-- `internal/llm` — интерфейс LLM и клиент OpenRouter
-- `internal/transport` — общие HTTP клиент-утилиты
-- `internal/telegram` — webhook хендлер и клиент Telegram Bot API
+
+- `cmd/app` — точка входа: конфигурирование logger, HTTP-клиента, сервисов и graceful shutdown.
+- `internal/config` — загрузка env с дефолтами.
+- `internal/httpserver` и `internal/middleware` — router + middleware.
+- `internal/auth` — сервис логина/логаута с `memory` или `file` store.
+- `internal/transport` — HTTP-клиент с таймаутом.
+- `internal/llm`, `internal/llmcontracts` — OpenRouter client, диалоговая история, контракты, генерация планов и решений.
+- `internal/telegram` — webhook handler, state machine для команд, Telegram client.
 
 ## Завершение работы
-Приложение поддерживает graceful shutdown по `SIGINT/SIGTERM`.
+
+Приложение корректно закрывает соединения по `SIGINT/SIGTERM` и дожидается выполнения текущих запросов в рамках таймаута 10 секунд.

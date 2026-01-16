@@ -13,6 +13,11 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 			start := time.Now()
 			ww := &responseWriter{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(ww, r)
+			if r.URL.Path == "/ping" {
+				// Пропускаем пинг, чтобы не засорять логи.
+				return
+			}
+
 			logger.Info("request",
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),

@@ -15,7 +15,7 @@ var AvailableModels = []ModelInfo{
 	},
 	{
 		ID:          "google/gemini-2.0-flash-exp:free",
-		Name:        "Gemini 2.0 Flash",
+		Name:        "Gemini 2.0 Flash free",
 		Description: "Быстрая модель Google (бесплатно)",
 	},
 	{

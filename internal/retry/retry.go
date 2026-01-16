@@ -49,16 +49,16 @@ func GetAttemptCallback(ctx context.Context) AttemptCallback {
 }
 
 type Policy struct {
-	BaseDelay       time.Duration
-	MaxDelay        time.Duration
-	Multiplier      float64
-	MaxAttempts     int
-	JitterFraction  float64
-	SnippetLimit    int
-	Sleep           Sleeper
-	Now             NowFunc
-	Rand            RandFunc
-	OnAttempt       AttemptCallback // Опциональный callback для уведомления о попытках
+	BaseDelay      time.Duration
+	MaxDelay       time.Duration
+	Multiplier     float64
+	MaxAttempts    int
+	JitterFraction float64
+	SnippetLimit   int
+	Sleep          Sleeper
+	Now            NowFunc
+	Rand           RandFunc
+	OnAttempt      AttemptCallback // Опциональный callback для уведомления о попытках
 }
 
 func DefaultPolicy() Policy {
