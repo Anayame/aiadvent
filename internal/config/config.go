@@ -54,7 +54,7 @@ func Load() (Config, error) {
 	cfg.AuthStorePath = getEnv("AUTH_STORE_PATH", "/data/auth_sessions.json")
 	cfg.AuthStoreType = strings.ToLower(getEnv("AUTH_STORE_TYPE", "file"))
 
-	reqTimeout, err := parseDuration(getEnv("HTTP_CLIENT_TIMEOUT", "15s"))
+	reqTimeout, err := parseDuration(getEnv("HTTP_CLIENT_TIMEOUT", "180s"))
 	if err != nil {
 		return Config{}, fmt.Errorf("parse HTTP_CLIENT_TIMEOUT: %w", err)
 	}

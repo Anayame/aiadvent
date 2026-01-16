@@ -29,16 +29,36 @@ type Sleeper func(ctx context.Context, d time.Duration) error
 type NowFunc func() time.Time
 type RandFunc func() float64
 
+// AttemptCallback вызывается перед каждой попыткой запроса.
+// attempt: номер попытки (начиная с 1), maxAttempts: максимальное количество попыток
+type AttemptCallback func(attempt int, maxAttempts int)
+
+type attemptCallbackKey struct{}
+
+// WithAttemptCallback добавляет callback для уведомления о попытках в контекст.
+func WithAttemptCallback(ctx context.Context, cb AttemptCallback) context.Context {
+	return context.WithValue(ctx, attemptCallbackKey{}, cb)
+}
+
+// GetAttemptCallback извлекает callback из контекста.
+func GetAttemptCallback(ctx context.Context) AttemptCallback {
+	if cb, ok := ctx.Value(attemptCallbackKey{}).(AttemptCallback); ok {
+		return cb
+	}
+	return nil
+}
+
 type Policy struct {
-	BaseDelay      time.Duration
-	MaxDelay       time.Duration
-	Multiplier     float64
-	MaxAttempts    int
-	JitterFraction float64
-	SnippetLimit   int
-	Sleep          Sleeper
-	Now            NowFunc
-	Rand           RandFunc
+	BaseDelay       time.Duration
+	MaxDelay        time.Duration
+	Multiplier      float64
+	MaxAttempts     int
+	JitterFraction  float64
+	SnippetLimit    int
+	Sleep           Sleeper
+	Now             NowFunc
+	Rand            RandFunc
+	OnAttempt       AttemptCallback // Опциональный callback для уведомления о попытках
 }
 
 func DefaultPolicy() Policy {
@@ -87,6 +107,13 @@ func DoHTTP(ctx context.Context, policy Policy, logger *slog.Logger, do func(ctx
 	for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
+		}
+
+		// Уведомляем о попытке (сначала проверяем контекст, потом policy)
+		if cb := GetAttemptCallback(ctx); cb != nil {
+			cb(attempt, policy.MaxAttempts)
+		} else if policy.OnAttempt != nil {
+			policy.OnAttempt(attempt, policy.MaxAttempts)
 		}
 
 		resp, body, err := do(ctx)

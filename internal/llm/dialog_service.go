@@ -4,10 +4,124 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"aiadvent/internal/retry"
 )
 
+// Re-export для удобства использования
+var WithAttemptCallback = retry.WithAttemptCallback
+
+// SolutionVariantResult содержит результат одного варианта решения задачи.
+type SolutionVariantResult struct {
+	ModelID    string // ID модели для API
+	Model      string // Название модели для отображения
+	Label      string // Тип решения (прямой ответ, пошаговое решение, промт, группа экспертов)
+	Response   string // Ответ от модели
+	SystemUsed string // Использованный системный промт
+}
+
+// SolutionVariantsResult содержит все варианты решения задачи.
+type SolutionVariantsResult struct {
+	TaskPrompt      string                // Исходный промт задачи
+	DirectAnswer    SolutionVariantResult // Прямой ответ
+	StepByStep      SolutionVariantResult // Пошаговое решение
+	GeneratedPrompt SolutionVariantResult // Сгенерированный промт
+	GroupExpert     SolutionVariantResult // Ответ группы экспертов
+}
+
 const (
+	// SYSTEM_PROMPT_DIRECT_ANSWER содержит системный промпт для получения прямого ответа.
+	SYSTEM_PROMPT_DIRECT_ANSWER = "Дай только ответ напрямую, без дополнительных рассуждений и информации, только ответ."
+
+	// SYSTEM_PROMPT_STEP_BY_STEP содержит системный промпт для получения пошагового решения.
+	SYSTEM_PROMPT_STEP_BY_STEP = `You are a precise problem-solving assistant.
+
+TASK
+The user will provide a problem or task. Produce a solution as a numbered, step-by-step procedure.
+
+MANDATORY LANGUAGE REQUIREMENT
+- The ENTIRE response MUST be written in Russian.
+- Do NOT use any other language in the response (including headings or short phrases), except universally recognized code keywords inside code blocks if absolutely necessary.
+
+STRICT OUTPUT RULES
+- Output ONLY the step-by-step solution.
+- Number every step consecutively starting from 1 (1., 2., 3., ...).
+- Do NOT add any extra commentary, explanations, background, or "thought process".
+- Do NOT include sections like "Assumptions", "Notes", "Summary", "Conclusion", or "Final answer" unless the task explicitly requires it.
+- Do NOT ask clarifying questions. If information is missing, make the minimal reasonable assumptions needed to proceed and incorporate them implicitly into the steps (without labeling them as assumptions).
+- Keep each step short and action-oriented.
+- If calculations are needed, show the operations inside the relevant step, but do not add narrative around them.
+
+FORMAT REQUIREMENTS
+- Use plain text.
+- Each step must be on its own line.
+- No bullet points, no tables, no headings.
+
+SAFETY
+Follow all applicable safety and policy constraints. If the request is disallowed, respond with a brief refusal.
+
+Now solve the user's task following the rules above.
+`
+
+	// SYSTEM_PROMPT_CREATE_PROMPT содержит системный промпт для создания промта для решения задачи.
+	SYSTEM_PROMPT_CREATE_PROMPT = "Составь промт для llm модели для решения задачи."
+
+	// SYSTEM_PROMPT_GROUP_EXPERT содержит системный промпт для группы экспертов.
+	SYSTEM_PROMPT_GROUP_EXPERT = `You are an Expert Panel Orchestrator.
+
+GOAL
+When the user provides a task prompt, you must:
+1) Create a panel of experts (2-3 roles) relevant to the task.
+2) Each expert independently produces their best solution.
+3) Provide a final synthesis that compares approaches and recommends a path forward.
+
+MANDATORY LANGUAGE REQUIREMENT
+- The ENTIRE response text MUST be written in Russian.
+- Do NOT use any other language (including expert titles, headings, or inline phrases), except universally recognized code keywords inside code blocks if absolutely necessary.
+
+CORE RULES
+- Do NOT ask clarifying questions unless the task is impossible without critical missing info.
+- If details are missing, make reasonable assumptions and list them explicitly.
+- Experts must be diverse (different disciplines, viewpoints, risk tolerance).
+- Experts should not copy each other: each must use a distinct approach or emphasis.
+- Prefer actionable outputs (steps, examples, checklists, pseudo-code) over generic advice.
+- Follow all safety and policy constraints.
+
+PROCESS (always follow)
+A) Parse the user task: restate it in 1–2 sentences.
+B) Choose experts:
+   - Output a short roster: {name, role, focus, success criteria}.
+C) Expert round:
+   - For each expert:
+     - Assumptions (if any)
+     - Solution (structured, concise, actionable)
+     - Risks / trade-offs
+     - What to verify / next steps
+D) Synthesis:
+   - Compare key differences (table-like text is OK).
+   - Recommend: best overall approach + when to choose alternatives.
+   - Provide a minimal “next actions” checklist.
+
+OUTPUT FORMAT (strict)
+1. Task Summary
+2. Expert Roster
+3. Expert Solutions
+   3.1 Expert 1: ...
+   3.2 Expert 2: ...
+   ...
+4. Synthesis & Recommendation
+5. Next Actions Checklist
+
+STYLE
+- Write in Russian only.
+- No emojis.
+- Be direct and concrete.
+`
+
 	// SYSTEM_PROMPT_CREATE_PLAN содержит системный промпт для формирования плана действий.
 	SYSTEM_PROMPT_CREATE_PLAN = `You are an Action Planner — a strict planner that turns a user’s goal into an executable action plan.
 
@@ -393,4 +507,156 @@ func (s *DialogService) doLLMRequest(ctx context.Context, model string, messages
 	}
 
 	return s.client.ChatCompletionWithSystem(ctx, systemPrompt, combinedPrompt, model)
+}
+
+// SolutionStepResult передаётся в callback при завершении этапа.
+type SolutionStepResult struct {
+	Step    int
+	Variant SolutionVariantResult
+	Err     error
+}
+
+// SolutionStepCallback вызывается после завершения каждого этапа (параллельно).
+type SolutionStepCallback func(result SolutionStepResult)
+
+// SolutionStepConfig описывает конфигурацию одного этапа решения.
+type SolutionStepConfig struct {
+	Step         int
+	Label        string
+	SystemPrompt string
+	Model        string // ID модели
+}
+
+// GetSolutionStepConfigs возвращает конфигурации всех этапов решения.
+func GetSolutionStepConfigs(model string) []SolutionStepConfig {
+	configs := []SolutionStepConfig{
+		{Step: 1, Label: "Прямой ответ", SystemPrompt: SYSTEM_PROMPT_DIRECT_ANSWER, Model: model},
+		{Step: 2, Label: "Пошаговое решение", SystemPrompt: SYSTEM_PROMPT_STEP_BY_STEP, Model: model},
+		{Step: 3, Label: "Сгенерированный промт", SystemPrompt: SYSTEM_PROMPT_CREATE_PROMPT, Model: AvailableModels[rand.Intn(len(AvailableModels))].ID},
+	}
+	if SYSTEM_PROMPT_GROUP_EXPERT != "" {
+		configs = append(configs, SolutionStepConfig{Step: 4, Label: "Группа экспертов", SystemPrompt: SYSTEM_PROMPT_GROUP_EXPERT, Model: model})
+	}
+	return configs
+}
+
+// AttemptNotifier хранит информацию о попытках для отображения в UI.
+// [0] - текущая попытка, [1] - максимум попыток
+type AttemptNotifier = [2]int32
+
+// GetSolutionVariantsParallel выполняет все запросы параллельно.
+// Вызывает callback по мере завершения каждого этапа.
+// attemptNotifiers - map[step]*AttemptNotifier для обновления информации о попытках (опционально).
+// Блокируется до завершения всех запросов.
+func (s *DialogService) GetSolutionVariantsParallel(ctx context.Context, model string, taskPrompt string, attemptNotifiers map[int]*AttemptNotifier, callback SolutionStepCallback) {
+	if model == "" {
+		model = s.defaultModel
+	}
+
+	configs := GetSolutionStepConfigs(model)
+
+	var wg sync.WaitGroup
+	for _, cfg := range configs {
+		wg.Add(1)
+		go func(cfg SolutionStepConfig) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					// При панике возвращаем ошибку через callback
+					callback(SolutionStepResult{
+						Step: cfg.Step,
+						Variant: SolutionVariantResult{
+							ModelID:    cfg.Model,
+							Model:      GetModelName(cfg.Model),
+							Label:      cfg.Label,
+							SystemUsed: cfg.SystemPrompt,
+						},
+						Err: fmt.Errorf("panic recovered: %v", r),
+					})
+				}
+			}()
+
+			// Создаём контекст с callback для уведомления о попытках
+			reqCtx := ctx
+			if attemptNotifiers != nil {
+				if notifier, ok := attemptNotifiers[cfg.Step]; ok && notifier != nil {
+					reqCtx = withAttemptNotifier(ctx, notifier)
+				}
+			}
+
+			response, err := s.client.ChatCompletionWithSystem(reqCtx, cfg.SystemPrompt, taskPrompt, cfg.Model)
+			callback(SolutionStepResult{
+				Step: cfg.Step,
+				Variant: SolutionVariantResult{
+					ModelID:    cfg.Model,
+					Model:      GetModelName(cfg.Model),
+					Label:      cfg.Label,
+					Response:   response,
+					SystemUsed: cfg.SystemPrompt,
+				},
+				Err: err,
+			})
+		}(cfg)
+	}
+	wg.Wait()
+}
+
+// withAttemptNotifier создаёт контекст с callback'ом для обновления AttemptNotifier.
+func withAttemptNotifier(ctx context.Context, notifier *AttemptNotifier) context.Context {
+	return WithAttemptCallback(ctx, func(attempt, maxAttempts int) {
+		atomic.StoreInt32(&notifier[0], int32(attempt))
+		atomic.StoreInt32(&notifier[1], int32(maxAttempts))
+	})
+}
+
+// ExecuteSolutionStep выполняет один этап решения задачи.
+// Используется для повторных запросов при ошибке.
+func (s *DialogService) ExecuteSolutionStep(ctx context.Context, step int, model string, taskPrompt string) SolutionStepResult {
+	if model == "" {
+		model = s.defaultModel
+	}
+
+	var systemPrompt, label string
+	switch step {
+	case 1:
+		systemPrompt = SYSTEM_PROMPT_DIRECT_ANSWER
+		label = "Прямой ответ"
+	case 2:
+		systemPrompt = SYSTEM_PROMPT_STEP_BY_STEP
+		label = "Пошаговое решение"
+	case 3:
+		systemPrompt = SYSTEM_PROMPT_CREATE_PROMPT
+		label = "Сгенерированный промт"
+	case 4:
+		systemPrompt = SYSTEM_PROMPT_GROUP_EXPERT
+		label = "Группа экспертов"
+	default:
+		return SolutionStepResult{Step: step, Err: fmt.Errorf("unknown step: %d", step)}
+	}
+
+	response, err := s.client.ChatCompletionWithSystem(ctx, systemPrompt, taskPrompt, model)
+	return SolutionStepResult{
+		Step: step,
+		Variant: SolutionVariantResult{
+			ModelID:    model,
+			Model:      GetModelName(model),
+			Label:      label,
+			Response:   response,
+			SystemUsed: systemPrompt,
+		},
+		Err: err,
+	}
+}
+
+// GetRandomModelExcept возвращает случайную модель, отличную от excludeModel.
+func GetRandomModelExcept(excludeModel string) string {
+	if len(AvailableModels) <= 1 {
+		return AvailableModels[0].ID
+	}
+	for {
+		m := AvailableModels[rand.Intn(len(AvailableModels))]
+		if m.ID != excludeModel {
+			return m.ID
+		}
+	}
 }

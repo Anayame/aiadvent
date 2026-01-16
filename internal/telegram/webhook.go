@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aiadvent/internal/auth"
@@ -46,6 +47,7 @@ var botCommands = []BotCommand{
 	{Command: "/ask", Description: "Режим обычных вопросов к LLM", RequireAuth: true},
 	{Command: "/ask_json", Description: "Режим JSON-ответов с контрактом", RequireAuth: true},
 	{Command: "/create_plan", Description: "Режим создания плана действий", RequireAuth: true},
+	{Command: "/solve", Description: "Варианты решения задачи. 1 - прямой ответ, 2 - пошаговое решение, 3 - промт, 4 - группа экспертов.", RequireAuth: true},
 	{Command: "/model", Description: "Изменить модель LLM", RequireAuth: true},
 	{Command: "/end", Description: "Выйти из текущего режима", RequireAuth: false},
 }
@@ -101,6 +103,16 @@ type userState struct {
 	lastDialogMessage string
 	// Флаг для отображения названия модели при следующем ответе
 	showModelName bool
+	// Режим ожидания задачи для /solve (после выбора модели)
+	solveMode bool
+	// Выбранная модель для /solve
+	solveModel string
+	// Задача для /solve (для retry)
+	solveTask string
+	// Message ID для каждого этапа solve (для редактирования при retry)
+	solveStepMessages map[int]int64
+	// Модель использованная для каждого этапа (для retry с другой моделью)
+	solveStepModels map[int]string
 }
 
 type AuthService interface {
@@ -114,6 +126,8 @@ type DialogService interface {
 	ClearDialog(ctx context.Context, dialogID string) error
 	CreatePlan(ctx context.Context, dialogID string, model string, userMessage string) (string, error)
 	ReplayCreatePlan(ctx context.Context, dialogID string, model string) (string, error)
+	GetSolutionVariantsParallel(ctx context.Context, model string, taskPrompt string, attemptNotifiers map[int]*llm.AttemptNotifier, callback llm.SolutionStepCallback)
+	ExecuteSolutionStep(ctx context.Context, step int, model string, taskPrompt string) llm.SolutionStepResult
 }
 
 type WebhookDeps struct {
@@ -275,6 +289,12 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 			return
 		}
 		h.handleCreatePlanCommand(ctx, msg)
+	case "/solve":
+		if !h.auth.IsAuthorized(ctx, msg.From.ID) {
+			h.reply(ctx, msg.Chat.ID, "Требуется авторизация. Отправьте /login, затем пароль отдельным сообщением.")
+			return
+		}
+		h.handleSolveCommand(ctx, msg, arg)
 	case "/model":
 		if !h.auth.IsAuthorized(ctx, msg.From.ID) {
 			h.reply(ctx, msg.Chat.ID, "Требуется авторизация. Отправьте /login, затем пароль отдельным сообщением.")
@@ -285,16 +305,18 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 		ask := h.isAskMode(msg.From.ID)
 		askJSON, _ := h.askJSONState(msg.From.ID)
 		dialogActive := h.isDialogMode(msg.From.ID)
-		if ask || askJSON || dialogActive {
+		solveActive := h.isSolveMode(msg.From.ID)
+		if ask || askJSON || dialogActive || solveActive {
 			h.setAskMode(msg.From.ID, false)
 			h.setAskJSONMode(msg.From.ID, false, "")
+			h.setSolveMode(msg.From.ID, false)
 			if dialogActive {
 				h.handleEndDialog(ctx, msg)
 			} else {
 				h.reply(ctx, msg.Chat.ID, "Режим вопросов выключен.")
 			}
 		} else {
-			h.reply(ctx, msg.Chat.ID, "Вы не в режиме вопросов. Отправьте /ask, /ask_json или /create_plan, чтобы начать.")
+			h.reply(ctx, msg.Chat.ID, "Вы не в режиме вопросов. Отправьте /ask, /ask_json, /create_plan или /solve, чтобы начать.")
 		}
 	default:
 		h.reply(ctx, msg.Chat.ID, "❌ Неизвестная команда.\n\n"+formatCommandList())
@@ -304,6 +326,12 @@ func (h *WebhookHandler) handleCommand(ctx context.Context, msg *Message, text s
 func (h *WebhookHandler) handleText(ctx context.Context, msg *Message, text string) {
 	if !h.auth.IsAuthorized(ctx, msg.From.ID) {
 		h.reply(ctx, msg.Chat.ID, "Нужно войти: отправьте /login и затем пароль отдельным сообщением")
+		return
+	}
+
+	// Проверяем режим solve
+	if h.isSolveMode(msg.From.ID) {
+		h.handleSolveTask(ctx, msg, text)
 		return
 	}
 
@@ -322,7 +350,7 @@ func (h *WebhookHandler) handleText(ctx context.Context, msg *Message, text stri
 		return
 	}
 
-	h.reply(ctx, msg.Chat.ID, "Чтобы задать вопрос, включите режим /ask, /ask_json или /create_plan. Команда /end выключает режим.")
+	h.reply(ctx, msg.Chat.ID, "Чтобы задать вопрос, включите режим /ask, /ask_json, /create_plan или /solve. Команда /end выключает режим.")
 }
 
 func (h *WebhookHandler) handleLogin(ctx context.Context, msg *Message, password string) {
@@ -679,6 +707,10 @@ func (h *WebhookHandler) handleCallbackQuery(ctx context.Context, cb *CallbackQu
 	switch action {
 	case "model":
 		h.handleModelCallback(ctx, cb, data)
+	case "solve_model":
+		h.handleSolveModelCallback(ctx, cb, data)
+	case "solve_retry":
+		h.handleSolveRetryCallback(ctx, cb, data)
 	case "retry":
 		h.handleRetryCallback(ctx, cb, data)
 	default:
@@ -1206,4 +1238,514 @@ func (h *WebhookHandler) handleDialogMessage(ctx context.Context, msg *Message, 
 
 	cancelAnimation()
 	h.bot.EditMessage(ctx, msg.Chat.ID, thinkingMessageID, answer)
+}
+
+// handleSolveCommand обрабатывает команду /solve - варианты решения задачи.
+func (h *WebhookHandler) handleSolveCommand(ctx context.Context, msg *Message, arg string) {
+	// Показываем выбор модели
+	h.showSolveModelSelection(ctx, msg)
+}
+
+// showSolveModelSelection показывает выбор модели для /solve.
+func (h *WebhookHandler) showSolveModelSelection(ctx context.Context, msg *Message) {
+	currentModel := h.getSelectedModel(msg.From.ID)
+	displayModel := currentModel
+	if displayModel == "" {
+		displayModel = h.defaultModel
+	}
+	currentModelName := "по умолчанию"
+	if displayModel != "" {
+		currentModelName = llm.GetModelName(displayModel)
+	}
+
+	text := fmt.Sprintf("📝 *Варианты решения задачи*\n\n🤖 Выберите модель:\n\nТекущая: %s\n\n_После выбора модели введите текст задачи._", currentModelName)
+	keyboard := h.buildSolveModelKeyboard(displayModel)
+
+	h.bot.SendMessageWithKeyboard(ctx, msg.Chat.ID, text, keyboard)
+}
+
+// buildSolveModelKeyboard создаёт inline клавиатуру для выбора модели в /solve.
+func (h *WebhookHandler) buildSolveModelKeyboard(currentModel string) *InlineKeyboardMarkup {
+	var rows [][]InlineKeyboardButton
+
+	for i, m := range llm.AvailableModels {
+		buttonText := m.Name
+		if m.ID == currentModel {
+			buttonText = "✓ " + buttonText
+		}
+
+		rows = append(rows, []InlineKeyboardButton{
+			{
+				Text:         buttonText,
+				CallbackData: fmt.Sprintf("solve_model:%d", i),
+			},
+		})
+	}
+
+	return &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// handleSolveModelCallback обрабатывает выбор модели для /solve.
+func (h *WebhookHandler) handleSolveModelCallback(ctx context.Context, cb *CallbackQuery, data string) {
+	// Парсим индекс модели
+	var modelIndex int
+	if _, err := fmt.Sscanf(data, "%d", &modelIndex); err != nil || modelIndex < 0 || modelIndex >= len(llm.AvailableModels) {
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "❌ Неверная модель")
+		return
+	}
+
+	selectedModel := llm.AvailableModels[modelIndex]
+
+	// Сохраняем выбранную модель и включаем режим ожидания задачи
+	h.setSolveModel(cb.From.ID, selectedModel.ID)
+	h.setSolveMode(cb.From.ID, true)
+
+	h.bot.AnswerCallbackQuery(ctx, cb.ID, fmt.Sprintf("✅ Модель: %s", selectedModel.Name))
+
+	// Обновляем сообщение с выбранной моделью
+	if cb.Message != nil {
+		h.bot.EditMessage(ctx, cb.Message.Chat.ID, cb.Message.MessageID, fmt.Sprintf("📝 *Варианты решения задачи*\n\n🤖 Модель: *%s*\n\n_Будет сделано 4 запроса с разными промтами._", selectedModel.Name))
+	}
+
+	// Отправляем приглашение ввести задачу
+	h.reply(ctx, cb.Message.Chat.ID, "Опишите задачу, для которой нужно получить варианты решения:\n\n_Команда /end отменит режим._")
+}
+
+// handleSolveTask обрабатывает текст задачи в режиме solve.
+func (h *WebhookHandler) handleSolveTask(ctx context.Context, msg *Message, text string) {
+	// Получаем выбранную модель
+	model := h.getSolveModel(msg.From.ID)
+
+	// Выключаем режим solve (но не очищаем данные - они нужны для retry)
+	h.setSolveMode(msg.From.ID, false)
+
+	// Выполняем запрос
+	h.executeSolveTask(ctx, msg.Chat.ID, msg.From.ID, model, text)
+}
+
+// executeSolveTask выполняет запрос вариантов решения задачи параллельно.
+func (h *WebhookHandler) executeSolveTask(ctx context.Context, chatID int64, userID int64, model string, task string) {
+	if h.dialogService == nil {
+		h.reply(ctx, chatID, "Сервис диалогов недоступен.")
+		return
+	}
+
+	// Сохраняем задачу для retry
+	h.setSolveTaskData(userID, task, model)
+
+	// Заголовок
+	header := fmt.Sprintf("📋 *Варианты решения задачи*\n\n📝 *Задача:*\n%s\n\n_Запросы выполняются параллельно..._", task)
+	h.reply(ctx, chatID, header)
+
+	// Создаём контекст с большим таймаутом (15 минут для 4 этапов с возможными retry)
+	solveCtx, cancelSolve := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancelSolve()
+
+	stepIcons := map[int]string{1: "🎯", 2: "📊", 3: "💡", 4: "👥"}
+	stepLabels := map[int]string{1: "Прямой ответ", 2: "Пошаговое решение", 3: "Сгенерированный промт", 4: "Группа экспертов"}
+
+	// Определяем количество этапов
+	totalSteps := 3
+	if llm.SYSTEM_PROMPT_GROUP_EXPERT != "" {
+		totalSteps = 4
+	}
+
+	// Каналы для остановки анимации каждого этапа
+	stopAnimations := make(map[int]chan struct{})
+	startTimes := make(map[int]time.Time)
+	attemptNotifiers := make(map[int]*llm.AttemptNotifier)
+
+	// Отправляем сообщения и запускаем анимацию для каждого этапа
+	for step := 1; step <= totalSteps; step++ {
+		msgCtx, msgCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		msgID, err := h.bot.SendMessage(msgCtx, chatID, fmt.Sprintf("%s *%d. %s*\n\n⏳ Думаю...", stepIcons[step], step, stepLabels[step]))
+		msgCancel()
+		if err != nil {
+			h.logger.Error("send thinking message failed", slog.String("error", err.Error()))
+			continue
+		}
+		h.setSolveStepMessage(userID, step, msgID)
+
+		// Запускаем анимацию для этого этапа
+		stopCh := make(chan struct{})
+		stopAnimations[step] = stopCh
+		startTimes[step] = time.Now()
+
+		// Создаём notifier для отслеживания попыток
+		notifier := &llm.AttemptNotifier{}
+		attemptNotifiers[step] = notifier
+
+		go h.runSolveStepAnimation(chatID, msgID, step, stepIcons[step], stepLabels[step], startTimes[step], notifier, stopCh)
+	}
+
+	// Callback для обработки результатов
+	callback := func(result llm.SolutionStepResult) {
+		h.logger.Info("solve step callback", slog.Int("step", result.Step), slog.Bool("has_error", result.Err != nil))
+
+		// Останавливаем анимацию для этого этапа
+		if stopCh, ok := stopAnimations[result.Step]; ok {
+			close(stopCh)
+		}
+
+		msgCtx, msgCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer msgCancel()
+
+		msgID := h.getSolveStepMessage(userID, result.Step)
+		h.setSolveStepModel(userID, result.Step, result.Variant.ModelID)
+
+		keyboard := h.buildSolveRetryKeyboard(result.Step)
+
+		// Вычисляем время выполнения
+		elapsed := ""
+		if startTime, ok := startTimes[result.Step]; ok {
+			elapsed = fmt.Sprintf(" ⏱ %s", formatDuration(time.Since(startTime)))
+		}
+
+		if result.Err != nil {
+			h.logger.Error("solve step error", slog.Int("step", result.Step), slog.String("error", result.Err.Error()))
+
+			// Формируем сообщение об ошибке с кнопками
+			errMsg := fmt.Sprintf("%s *%d. %s*%s\n\n❌ Ошибка: %v",
+				stepIcons[result.Step], result.Step, result.Variant.Label, elapsed, result.Err)
+
+			if msgID != 0 {
+				h.bot.EditMessageKeyboard(msgCtx, chatID, msgID, errMsg, keyboard)
+			}
+		} else {
+			msg := fmt.Sprintf("%s *%d. %s*%s\n🤖 Модель: _%s_\n\n%s",
+				stepIcons[result.Step], result.Step, result.Variant.Label, elapsed, result.Variant.Model, result.Variant.Response)
+			if msgID != 0 {
+				h.bot.EditMessageKeyboard(msgCtx, chatID, msgID, msg, keyboard)
+			}
+		}
+	}
+
+	// Запускаем параллельное выполнение (блокируется до завершения всех)
+	h.dialogService.GetSolutionVariantsParallel(solveCtx, model, task, attemptNotifiers, callback)
+
+	// Финальное сообщение
+	finishCtx, finishCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer finishCancel()
+	h.reply(finishCtx, chatID, "━━━━━━━━━━━━━━━━━━━━\n\n✨ Все запросы завершены!\n\nИспользуйте /solve для новой задачи.")
+}
+
+// runSolveStepAnimation запускает анимацию "Думаю..." с таймером для одного этапа.
+// attemptInfo: указатель на [2]int{currentAttempt, maxAttempts} для отображения номера попытки
+func (h *WebhookHandler) runSolveStepAnimation(chatID int64, msgID int64, step int, icon string, label string, startTime time.Time, attemptInfo *[2]int32, stopCh chan struct{}) {
+	states := []string{"⏳ Думаю", "⏳ Думаю.", "⏳ Думаю..", "⏳ Думаю..."}
+	ticker := time.NewTicker(800 * time.Millisecond)
+	defer ticker.Stop()
+
+	i := 0
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			i = (i + 1) % len(states)
+			elapsed := formatDuration(time.Since(startTime))
+
+			// Формируем текст с номером попытки если есть
+			attemptText := ""
+			if attemptInfo != nil {
+				attempt := atomic.LoadInt32(&attemptInfo[0])
+				maxAttempts := atomic.LoadInt32(&attemptInfo[1])
+				if attempt > 1 {
+					attemptText = fmt.Sprintf(" 🔄 %d/%d", attempt, maxAttempts)
+				}
+			}
+
+			text := fmt.Sprintf("%s *%d. %s*\n\n⏱ %s %s%s", icon, step, label, elapsed, states[i], attemptText)
+
+			editCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// Игнорируем ошибки редактирования - продолжаем анимацию
+			_ = h.bot.EditMessage(editCtx, chatID, msgID, text)
+			cancel()
+		}
+	}
+}
+
+// formatDuration форматирует длительность в читаемый вид.
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	m := d / time.Minute
+	s := (d % time.Minute) / time.Second
+	if m > 0 {
+		return fmt.Sprintf("%dм %dс", m, s)
+	}
+	return fmt.Sprintf("%dс", s)
+}
+
+// buildSolveRetryKeyboard создаёт клавиатуру с кнопками retry для solve.
+func (h *WebhookHandler) buildSolveRetryKeyboard(step int) *InlineKeyboardMarkup {
+	return &InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{
+				{Text: "🔁 Повторить", CallbackData: fmt.Sprintf("solve_retry:%d:same", step)},
+				{Text: "🔄 Другая модель", CallbackData: fmt.Sprintf("solve_retry:%d:other", step)},
+			},
+		},
+	}
+}
+
+// handleSolveRetryCallback обрабатывает нажатие кнопки retry для solve.
+func (h *WebhookHandler) handleSolveRetryCallback(ctx context.Context, cb *CallbackQuery, data string) {
+	// Парсим данные: step:action (например "1:same" или "2:other")
+	parts := strings.Split(data, ":")
+	if len(parts) != 2 {
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "❌ Неверный формат")
+		return
+	}
+
+	var step int
+	if _, err := fmt.Sscanf(parts[0], "%d", &step); err != nil {
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "❌ Неверный этап")
+		return
+	}
+
+	action := parts[1]
+
+	// Получаем сохранённые данные
+	task := h.getSolveTask(cb.From.ID)
+	if task == "" {
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "❌ Задача не найдена. Используйте /solve")
+		return
+	}
+
+	// Определяем модель
+	var model string
+	previousModel := h.getSolveStepModel(cb.From.ID, step)
+
+	if action == "same" {
+		model = h.getSolveModel(cb.From.ID)
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, "🔁 Повторяю запрос...")
+	} else {
+		model = llm.GetRandomModelExcept(previousModel)
+		h.bot.AnswerCallbackQuery(ctx, cb.ID, fmt.Sprintf("🔄 Пробую %s...", llm.GetModelName(model)))
+	}
+
+	// Обновляем сообщение на "Думаю..."
+	stepIcons := map[int]string{1: "🎯", 2: "📊", 3: "💡", 4: "👥"}
+	stepLabels := map[int]string{1: "Прямой ответ", 2: "Пошаговое решение", 3: "Сгенерированный промт", 4: "Группа экспертов"}
+
+	if cb.Message != nil {
+		h.bot.EditMessage(ctx, cb.Message.Chat.ID, cb.Message.MessageID,
+			fmt.Sprintf("%s *%d. %s*\n\n⏳ Думаю... (%s)", stepIcons[step], step, stepLabels[step], llm.GetModelName(model)))
+	}
+
+	// Выполняем запрос в горутине с анимацией
+	go func() {
+		startTime := time.Now()
+
+		// Создаём notifier для отслеживания попыток
+		attemptInfo := &[2]int32{}
+
+		// Запускаем анимацию
+		stopAnimation := make(chan struct{})
+		if cb.Message != nil {
+			go h.runSolveStepAnimationWithModel(cb.Message.Chat.ID, cb.Message.MessageID, step, stepIcons[step], stepLabels[step], llm.GetModelName(model), startTime, attemptInfo, stopAnimation)
+		}
+
+		reqCtx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+
+		// Добавляем callback для обновления attemptInfo
+		reqCtx = retry.WithAttemptCallback(reqCtx, func(attempt, maxAttempts int) {
+			atomic.StoreInt32(&attemptInfo[0], int32(attempt))
+			atomic.StoreInt32(&attemptInfo[1], int32(maxAttempts))
+		})
+
+		result := h.dialogService.ExecuteSolutionStep(reqCtx, step, model, task)
+
+		// Останавливаем анимацию
+		close(stopAnimation)
+
+		msgCtx, msgCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer msgCancel()
+
+		h.setSolveStepModel(cb.From.ID, step, model)
+
+		keyboard := h.buildSolveRetryKeyboard(step)
+		elapsed := fmt.Sprintf(" ⏱ %s", formatDuration(time.Since(startTime)))
+
+		if result.Err != nil {
+			h.logger.Error("solve retry error", slog.Int("step", step), slog.String("error", result.Err.Error()))
+			errMsg := fmt.Sprintf("%s *%d. %s*%s\n\n❌ Ошибка: %v",
+				stepIcons[step], step, stepLabels[step], elapsed, result.Err)
+			if cb.Message != nil {
+				h.bot.EditMessageKeyboard(msgCtx, cb.Message.Chat.ID, cb.Message.MessageID, errMsg, keyboard)
+			}
+		} else {
+			msg := fmt.Sprintf("%s *%d. %s*%s\n🤖 Модель: _%s_\n\n%s",
+				stepIcons[step], step, result.Variant.Label, elapsed, result.Variant.Model, result.Variant.Response)
+			if cb.Message != nil {
+				h.bot.EditMessageKeyboard(msgCtx, cb.Message.Chat.ID, cb.Message.MessageID, msg, keyboard)
+			}
+		}
+	}()
+}
+
+// runSolveStepAnimationWithModel запускает анимацию с указанием модели.
+func (h *WebhookHandler) runSolveStepAnimationWithModel(chatID int64, msgID int64, step int, icon string, label string, modelName string, startTime time.Time, attemptInfo *[2]int32, stopCh chan struct{}) {
+	states := []string{"⏳ Думаю", "⏳ Думаю.", "⏳ Думаю..", "⏳ Думаю..."}
+	ticker := time.NewTicker(800 * time.Millisecond)
+	defer ticker.Stop()
+
+	i := 0
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			i = (i + 1) % len(states)
+			elapsed := formatDuration(time.Since(startTime))
+
+			// Формируем текст с номером попытки если есть
+			attemptText := ""
+			if attemptInfo != nil {
+				attempt := atomic.LoadInt32(&attemptInfo[0])
+				maxAttempts := atomic.LoadInt32(&attemptInfo[1])
+				if attempt > 1 {
+					attemptText = fmt.Sprintf(" 🔄 %d/%d", attempt, maxAttempts)
+				}
+			}
+
+			text := fmt.Sprintf("%s *%d. %s*\n\n⏱ %s %s%s\n🤖 _%s_", icon, step, label, elapsed, states[i], attemptText, modelName)
+
+			editCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// Игнорируем ошибки редактирования - продолжаем анимацию
+			_ = h.bot.EditMessage(editCtx, chatID, msgID, text)
+			cancel()
+		}
+	}
+}
+
+// setSolveMode устанавливает режим ожидания задачи для /solve.
+func (h *WebhookHandler) setSolveMode(userID int64, enabled bool) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.solveMode = enabled
+	h.state[userID] = state
+}
+
+// isSolveMode проверяет, находится ли пользователь в режиме solve.
+func (h *WebhookHandler) isSolveMode(userID int64) bool {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	return ok && state.solveMode
+}
+
+// setSolveModel сохраняет выбранную модель для /solve.
+func (h *WebhookHandler) setSolveModel(userID int64, model string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.solveModel = model
+	h.state[userID] = state
+}
+
+// getSolveModel возвращает выбранную модель для /solve.
+func (h *WebhookHandler) getSolveModel(userID int64) string {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok {
+		return ""
+	}
+	return state.solveModel
+}
+
+// setSolveTaskData сохраняет данные задачи для /solve (для retry).
+func (h *WebhookHandler) setSolveTaskData(userID int64, task string, model string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.solveTask = task
+	state.solveModel = model
+	state.solveStepMessages = make(map[int]int64)
+	state.solveStepModels = make(map[int]string)
+	h.state[userID] = state
+}
+
+// getSolveTask возвращает сохранённую задачу для /solve.
+func (h *WebhookHandler) getSolveTask(userID int64) string {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok {
+		return ""
+	}
+	return state.solveTask
+}
+
+// setSolveStepMessage сохраняет ID сообщения для этапа solve.
+func (h *WebhookHandler) setSolveStepMessage(userID int64, step int, msgID int64) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	if state.solveStepMessages == nil {
+		state.solveStepMessages = make(map[int]int64)
+	}
+	state.solveStepMessages[step] = msgID
+	h.state[userID] = state
+}
+
+// getSolveStepMessage возвращает ID сообщения для этапа solve.
+func (h *WebhookHandler) getSolveStepMessage(userID int64, step int) int64 {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok || state.solveStepMessages == nil {
+		return 0
+	}
+	return state.solveStepMessages[step]
+}
+
+// setSolveStepModel сохраняет модель использованную для этапа solve.
+func (h *WebhookHandler) setSolveStepModel(userID int64, step int, model string) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	if state.solveStepModels == nil {
+		state.solveStepModels = make(map[int]string)
+	}
+	state.solveStepModels[step] = model
+	h.state[userID] = state
+}
+
+// getSolveStepModel возвращает модель использованную для этапа solve.
+func (h *WebhookHandler) getSolveStepModel(userID int64, step int) string {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state, ok := h.state[userID]
+	if !ok || state.solveStepModels == nil {
+		return ""
+	}
+	return state.solveStepModels[step]
+}
+
+// clearSolveState очищает состояние /solve.
+func (h *WebhookHandler) clearSolveState(userID int64) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	state := h.state[userID]
+	state.solveMode = false
+	state.solveModel = ""
+	state.solveTask = ""
+	state.solveStepMessages = nil
+	state.solveStepModels = nil
+	h.state[userID] = state
 }
